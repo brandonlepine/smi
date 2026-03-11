@@ -1,0 +1,7 @@
+.venv/** 
+
+benchmark_datasets/**  
+
+legalbench/**
+.DS_Store
+.env
