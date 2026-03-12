@@ -5,3 +5,8 @@ benchmark_datasets/**
 legalbench/**
 .DS_Store
 .env
+models/llama2-7b/** 
+results/** 
+logs/** 
+**/__pycache__/** 
+**__pycache__** 
