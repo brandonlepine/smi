@@ -2,11 +2,38 @@
 
 benchmark_datasets/**  
 
-legalbench/**
+legalbench/
 .DS_Store
 .env
-models/llama2-7b/** 
+models/
 results/** 
 logs/** 
 **/__pycache__/** 
 **__pycache__** 
+
+# Local artifacts / generated data (keep repo clean)
+annotation_protocol.md
+
+# Generated dataset exports (repo root)
+cf_v*.json
+cf_v*.json.bak
+*_combined.json
+*_tier*.json
+
+# Torch / embedding shards
+*.pt
+*.pth
+*.safetensors
+extractions_*/**
+extractions_v*/**
+
+# Analysis outputs
+stage*_results/**
+stage*_output/**
+stage*_outputs/**
+artifacts/**
+outputs/**
+
+# Common local backups
+*.bak
+*.tmp

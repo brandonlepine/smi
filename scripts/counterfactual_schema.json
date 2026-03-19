@@ -1,0 +1,240 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "medqa-counterfactual-benchmark-v1.0",
+  "title": "MedQA Demographic Counterfactual Benchmark",
+  "description": "Schema for clinically validated demographic counterfactuals of MedQA-USMLE questions. See annotation_protocol.md for full definitions.",
+  "type": "array",
+  "items": {
+    "$ref": "#/$defs/BenchmarkRecord"
+  },
+
+  "$defs": {
+
+    "BenchmarkRecord": {
+      "type": "object",
+      "required": ["question_id", "original", "counterfactuals"],
+      "additionalProperties": false,
+      "properties": {
+        "question_id": {
+          "type": "string",
+          "pattern": "^medqa_[a-z]+_[0-9]+$",
+          "description": "Unique identifier: medqa_{split}_{index}"
+        },
+        "original": { "$ref": "#/$defs/OriginalQuestion" },
+        "counterfactuals": { "$ref": "#/$defs/CounterfactualOutput" }
+      }
+    },
+
+    "OriginalQuestion": {
+      "type": "object",
+      "required": ["question", "options", "answer", "answer_idx"],
+      "additionalProperties": false,
+      "properties": {
+        "question": {
+          "type": "string",
+          "description": "Original question stem text"
+        },
+        "options": {
+          "type": "object",
+          "description": "Answer choices keyed by letter (A, B, C, D)",
+          "patternProperties": {
+            "^[A-D]$": { "type": "string" }
+          },
+          "additionalProperties": false,
+          "minProperties": 4,
+          "maxProperties": 4
+        },
+        "answer": {
+          "type": "string",
+          "description": "Gold answer text (NEVER included in variant prompts)"
+        },
+        "answer_idx": {
+          "type": "string",
+          "enum": ["A", "B", "C", "D"],
+          "description": "Gold answer letter"
+        }
+      }
+    },
+
+    "CounterfactualOutput": {
+      "type": "object",
+      "required": ["original_demographics", "clinical_cue_interactions", "variants"],
+      "additionalProperties": false,
+      "properties": {
+        "original_demographics": { "$ref": "#/$defs/OriginalDemographics" },
+        "clinical_cue_interactions": { "$ref": "#/$defs/ClinicalCueInteractions" },
+        "variants": { "$ref": "#/$defs/VariantCategories" }
+      }
+    },
+
+    "OriginalDemographics": {
+      "type": "object",
+      "required": ["gender", "age", "race_ethnicity"],
+      "additionalProperties": false,
+      "properties": {
+        "gender": {
+          "type": "string",
+          "enum": ["male", "female", "neutral", "unspecified"]
+        },
+        "age": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "maximum": 120,
+          "description": "Detected age in years, or null if not mentioned"
+        },
+        "race_ethnicity": {
+          "type": ["string", "null"],
+          "description": "Detected race/ethnicity descriptor, or null if not mentioned"
+        }
+      }
+    },
+
+    "ClinicalCueInteractions": {
+      "type": "object",
+      "required": [
+        "phenotypic_cues",
+        "sex_specific_clinical_features",
+        "sexual_behavior_cues",
+        "family_history_patterns",
+        "epidemiologic_associations"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "phenotypic_cues": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Observable physical findings that correlate with demographics (e.g., 'light-skinned complexion')"
+        },
+        "sex_specific_clinical_features": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Findings tied to biological sex (e.g., 'pregnant', 'prostate exam')"
+        },
+        "sexual_behavior_cues": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Sexual behavior descriptors — clinical risk factors, NOT gender markers"
+        },
+        "family_history_patterns": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Inheritance patterns implying sex-linkage or population genetics"
+        },
+        "epidemiologic_associations": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Known disease-population associations (e.g., 'sickle cell — African descent')"
+        }
+      }
+    },
+
+    "VariantCategories": {
+      "type": "object",
+      "required": ["gender", "age", "race_ethnicity", "control"],
+      "additionalProperties": false,
+      "properties": {
+        "gender": {
+          "type": "object",
+          "required": ["male", "female", "neutral"],
+          "additionalProperties": false,
+          "properties": {
+            "male":    { "$ref": "#/$defs/AnnotatedVariant" },
+            "female":  { "$ref": "#/$defs/AnnotatedVariant" },
+            "neutral": { "$ref": "#/$defs/AnnotatedVariant" }
+          }
+        },
+        "age": {
+          "type": "object",
+          "required": ["young_adult", "middle_aged", "elderly"],
+          "additionalProperties": false,
+          "properties": {
+            "young_adult": { "$ref": "#/$defs/AnnotatedVariant" },
+            "middle_aged": { "$ref": "#/$defs/AnnotatedVariant" },
+            "elderly":     { "$ref": "#/$defs/AnnotatedVariant" }
+          }
+        },
+        "race_ethnicity": {
+          "type": "object",
+          "required": ["White", "Black/African American", "Hispanic/Latino", "Asian", "no_race_specified"],
+          "additionalProperties": false,
+          "properties": {
+            "White":                  { "$ref": "#/$defs/AnnotatedVariant" },
+            "Black/African American": { "$ref": "#/$defs/AnnotatedVariant" },
+            "Hispanic/Latino":        { "$ref": "#/$defs/AnnotatedVariant" },
+            "Asian":                  { "$ref": "#/$defs/AnnotatedVariant" },
+            "no_race_specified":      { "$ref": "#/$defs/AnnotatedVariant" }
+          }
+        },
+        "control": {
+          "type": "object",
+          "required": ["neutral_rework", "irrelevant_surface"],
+          "additionalProperties": false,
+          "properties": {
+            "neutral_rework":     { "$ref": "#/$defs/AnnotatedVariant" },
+            "irrelevant_surface": { "$ref": "#/$defs/AnnotatedVariant" }
+          }
+        }
+      }
+    },
+
+    "AnnotatedVariant": {
+      "type": "object",
+      "required": [
+        "text",
+        "reason_if_null",
+        "counterfactual_validity",
+        "clinical_coherence",
+        "target_attribute_role",
+        "gold_answer_invariance",
+        "prior_shift_expected",
+        "edit_locality",
+        "notes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "text": {
+          "type": ["string", "null"],
+          "description": "Full rewritten question stem + answer choices, or null if edit is invalid/impossible/identical"
+        },
+        "reason_if_null": {
+          "type": ["string", "null"],
+          "description": "Required explanation when text is null. Use 'identical_to_original' when variant matches original."
+        },
+        "counterfactual_validity": {
+          "type": "string",
+          "enum": ["valid", "questionable", "invalid"],
+          "description": "Whether the edit produces a coherent, single-attribute change"
+        },
+        "clinical_coherence": {
+          "type": "string",
+          "enum": ["preserved", "weakened", "broken"],
+          "description": "Whether the resulting vignette is a plausible clinical scenario"
+        },
+        "target_attribute_role": {
+          "type": "string",
+          "enum": ["irrelevant", "epidemiologic", "mechanistically_causal", "sex_specific", "socially_loaded"],
+          "description": "Why the demographic attribute matters (or doesn't) for this specific question"
+        },
+        "gold_answer_invariance": {
+          "type": "string",
+          "enum": ["invariant", "likely_invariant", "uncertain", "likely_changed"],
+          "description": "Whether the correct answer is the same after the edit"
+        },
+        "prior_shift_expected": {
+          "type": "string",
+          "enum": ["none", "mild", "moderate", "strong"],
+          "description": "Whether the diagnostic probability distribution shifts, independent of top-answer change"
+        },
+        "edit_locality": {
+          "type": "string",
+          "enum": ["minimal", "sentence_level", "multi_sentence"],
+          "description": "Scope of textual changes: minimal (1-3 tokens), sentence_level, or multi_sentence"
+        },
+        "notes": {
+          "type": ["string", "null"],
+          "description": "Free-text explanation of concerns, conflicts, or edge cases"
+        }
+      }
+    }
+  }
+}
