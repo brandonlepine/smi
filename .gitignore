@@ -19,6 +19,7 @@ cf_v*.json
 cf_v*.json.bak
 *_combined.json
 *_tier*.json
+pass_*.json
 
 # Torch / embedding shards
 *.pt
@@ -33,6 +34,7 @@ stage*_output/**
 stage*_outputs/**
 artifacts/**
 outputs/**
+medqa_audit/
 
 # Common local backups
 *.bak
