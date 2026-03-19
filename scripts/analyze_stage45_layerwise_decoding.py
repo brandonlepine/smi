@@ -39,24 +39,53 @@ Feature scopes
 --------------
 final_token, mean_pool, edited_span_mean, edited_window_mean, prefix_mean, suffix_mean
 
+Architecture
+------------
+Phase A (extraction): load model, iterate pairs one at a time, pool hidden states
+  layer-by-layer, flush compact numpy chunks to disk every N pairs.
+Phase B (probing): unload model, load cached chunks per scope, fit probes.
+
 Usage
 -----
+  # Full run (extract + probe):
   python analyze_stage45_layerwise_decoding.py \\
     --model_path models/llama2-13b \\
     --data_path cf_v6_balanced.json \\
     --output_dir stage45_results \\
-    --device auto \\
-    --max_pairs 200 \\
-    --feature_scope final_token
+    --device auto --max_pairs 200 \\
+    --feature_scope final_token mean_pool
+
+  # Extraction only:
+  python analyze_stage45_layerwise_decoding.py \\
+    --model_path models/llama2-13b \\
+    --data_path cf_v6_balanced.json \\
+    --output_dir stage45_results \\
+    --extract_only
+
+  # Resume after interruption (same command, skips completed pairs):
+  python analyze_stage45_layerwise_decoding.py \\
+    --model_path models/llama2-13b \\
+    --data_path cf_v6_balanced.json \\
+    --output_dir stage45_results
+
+  # Probe only (no model loading):
+  python analyze_stage45_layerwise_decoding.py \\
+    --data_path cf_v6_balanced.json \\
+    --output_dir stage45_results \\
+    --probe_only
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import gc
 import hashlib
 import json
+import os
 import re
+import tempfile
+import time
 import warnings
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -85,7 +114,7 @@ import matplotlib.pyplot as plt
 # ---------------------------------------------------------------------------
 
 SCRIPT_NAME = "analyze_stage45_layerwise_decoding.py"
-VERSION = "2.1"
+VERSION = "3.0"
 
 PROMPT_TEMPLATE = """\
 Question:
@@ -132,21 +161,15 @@ FEATURE_SCOPES = [
     "suffix_mean",
 ]
 
+TRUNCATION_MAX_LENGTH = 2048
+
 # ---------------------------------------------------------------------------
-# Req 16: Stage 3 alignment constants
+# Stage 3 alignment constants
 # ---------------------------------------------------------------------------
 
-# Layer region boundaries (exclusive upper bounds for the named region).
-# Layer 0 = embedding; transformer layers are 1-indexed.
-#   early : 1 <= layer < EARLY_END_LAYER  (layers 1–3)
-#   mid   : EARLY_END_LAYER <= layer < MID_END_LAYER  (layers 4–15)
-#   late  : layer >= MID_END_LAYER  (layers 16+)
 EARLY_END_LAYER = 4
 MID_END_LAYER   = 16
 
-# Values may be a single region string or a list of acceptable regions.
-# sex_gender: Stage 3 showed early-to-mid peaks, so both are accepted.
-# sexual_orientation: Stage 3 showed diffuse / mid-late patterns.
 STAGE3_EXPECTED_REGION: dict[str, str | list[str] | None] = {
     "gender_identity":    "early",
     "race":               "early",
@@ -166,17 +189,10 @@ _EXPLICIT_PATTERNS = {"gay", "straight", "lesbian", "bisexual", "queer",
                       "heterosexual", "homosexual"}
 
 # ---------------------------------------------------------------------------
-# Req 16: layer_to_region helper
+# layer_to_region helper
 # ---------------------------------------------------------------------------
 
 def layer_to_region(layer_idx: int) -> str:
-    """Map a layer index to a named region.
-
-    layer_idx == 0                       → 'embedding'
-    1 <= layer_idx < EARLY_END_LAYER (4) → 'early'
-    4 <= layer_idx < MID_END_LAYER  (16) → 'mid'
-    layer_idx >= 16                      → 'late'
-    """
     if layer_idx == 0:
         return "embedding"
     if layer_idx < EARLY_END_LAYER:
@@ -187,25 +203,20 @@ def layer_to_region(layer_idx: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Req 9: Uniform-chance / normalized gain helpers
+# Uniform-chance / normalized gain helpers
 # ---------------------------------------------------------------------------
 
 def compute_normalized_gain(balanced_accuracy: float, n_classes: int) -> float:
-    """Normalized decoding gain: (bal_acc - uniform) / (1 - uniform).
-
-    Maps [uniform, 1.0] → [0, 1]; below-uniform values map to negative.
-    """
     uniform = 1.0 / max(n_classes, 1)
     denom = 1.0 - uniform
     return (balanced_accuracy - uniform) / denom if denom > 1e-9 else 0.0
 
 
 # ---------------------------------------------------------------------------
-# Req 3: split validity check
+# Split validity check
 # ---------------------------------------------------------------------------
 
 def validate_split(y_train: np.ndarray, y_test: np.ndarray) -> str | None:
-    """Returns an error string or None if the split is valid."""
     if len(y_train) == 0 or len(y_test) == 0:
         return "empty_split"
     if len(np.unique(y_train)) < 2:
@@ -218,7 +229,7 @@ def validate_split(y_train: np.ndarray, y_test: np.ndarray) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Req 2: balance_training_set helper
+# balance_training_set helper
 # ---------------------------------------------------------------------------
 
 def balance_training_set(
@@ -226,7 +237,6 @@ def balance_training_set(
     y_train: np.ndarray,
     seed: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Undersample majority classes to size of smallest class. Operates on train split only."""
     rng_local = np.random.default_rng(seed + 9999)
     counts = Counter(y_train.tolist())
     min_count = min(counts.values())
@@ -251,7 +261,6 @@ def _normalize_label(label) -> str:
 
 
 def assign_family(itype: str, attr_val) -> str | None:
-    """Map (intervention_type, attribute_value) → family key.  Returns None for unrecognised itypes."""
     itype = (itype or "").strip()
     attr_norm = _normalize_label(attr_val)
     if itype in {"neutral_rework", "irrelevant_surface"}:
@@ -292,7 +301,6 @@ def format_prompt(q: str, options: dict) -> str:
 
 
 def load_pairs(data_path: str, include_controls: bool = False) -> tuple[list, dict]:
-    """Load counterfactual pairs from cf_v6_balanced.json.  Returns (pairs, assignment_log)."""
     with open(data_path) as f:
         records = json.load(f)
 
@@ -404,19 +412,8 @@ def find_edited_span(
     orig_ids: list[int],
     cf_ids:   list[int],
 ) -> tuple[int, int, int, bool]:
-    """Locate the token span that differs between orig and cf using LCS prefix/suffix.
-
-    Returns (edit_start, edit_end_orig, edit_end_cf, fallback_used).
-      edit_start    — first token that differs (same index in both sequences)
-      edit_end_orig — one-past-last changed token in orig_ids
-      edit_end_cf   — one-past-last changed token in cf_ids
-      fallback_used — True when sequences are identical or alignment failed
-
-    edit_start is guaranteed < edit_end_orig and edit_start < edit_end_cf.
-    """
     n_orig, n_cf = len(orig_ids), len(cf_ids)
 
-    # Longest common prefix
     prefix_len = 0
     for i in range(min(n_orig, n_cf)):
         if orig_ids[i] == cf_ids[i]:
@@ -424,7 +421,6 @@ def find_edited_span(
         else:
             break
 
-    # Longest common suffix (cannot overlap with prefix)
     max_suffix = min(n_orig - prefix_len, n_cf - prefix_len)
     suffix_len = 0
     for i in range(1, max_suffix + 1):
@@ -437,7 +433,6 @@ def find_edited_span(
     edit_end_orig = n_orig - suffix_len
     edit_end_cf   = n_cf   - suffix_len
 
-    # Degenerate cases: identical seqs or empty edit region
     if edit_start >= edit_end_orig or edit_start >= edit_end_cf:
         return 0, n_orig, n_cf, True
 
@@ -449,14 +444,13 @@ def find_edited_span(
 # ---------------------------------------------------------------------------
 
 def pool_hidden(
-    hidden: torch.Tensor,  # (1, seq_len, hidden_size) — already .float().cpu()
+    hidden: torch.Tensor,
     scope:  str,
     edit_start:  int,
-    edit_end:    int,       # use edit_end_orig for orig hidden, edit_end_cf for cf hidden
+    edit_end:    int,
     window_radius: int = 2,
 ) -> np.ndarray:
-    """Extract a 1-D feature vector from a hidden-state tensor."""
-    h = hidden[0]          # (seq_len, H)
+    h = hidden[0]
     seq_len = h.shape[0]
 
     def _safe_slice(s: int, e: int) -> np.ndarray:
@@ -466,280 +460,585 @@ def pool_hidden(
 
     if scope == "final_token":
         return h[-1].numpy()
-
     if scope == "mean_pool":
         return h.mean(dim=0).numpy()
-
     if scope == "edited_span_mean":
         return _safe_slice(edit_start, edit_end)
-
     if scope == "edited_window_mean":
         return _safe_slice(edit_start - window_radius, edit_end + window_radius)
-
     if scope == "prefix_mean":
-        # tokens before the edit — common prefix, so same for orig and cf
         e = max(1, edit_start)
         return _safe_slice(0, e)
-
     if scope == "suffix_mean":
-        # tokens after the edit; edit_end differs per sequence, so caller passes correct one
         return _safe_slice(edit_end, seq_len)
-
     raise ValueError(f"Unknown feature scope: {scope!r}")
 
 
 # ---------------------------------------------------------------------------
-# Main extraction loop
+# Pair key for checkpoint/resume
 # ---------------------------------------------------------------------------
 
-@torch.no_grad()
-def _run_forward(model, tok, prompt: str, device: str) -> tuple[list[torch.Tensor], list[int]]:
-    """One forward pass with output_hidden_states=True.
-    Returns (hidden_states, input_ids).
-    hidden_states[0] = embedding layer, hidden_states[1..L] = transformer layers.
+def make_pair_key(pair: dict) -> str:
+    """Stable unique key for a counterfactual pair."""
+    raw = f"{pair['qid']}|{pair['family']}|{pair['attr_val']}|{pair['cf_prompt']}"
+    return hashlib.md5(raw.encode()).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Single-pair extraction (memory-safe)
+# ---------------------------------------------------------------------------
+
+def extract_single_pair(
+    model, tok, pair: dict, device: str, scopes: list[str],
+    window_radius: int = 2, min_prefix_tokens: int = 2, min_suffix_tokens: int = 2,
+) -> tuple[dict, dict, dict, dict]:
+    """Extract pooled features for one pair with aggressive memory management.
+
+    Returns:
+        orig_pooled:  {scope: np.ndarray [n_layers, hidden_size]}
+        cf_pooled:    {scope: np.ndarray [n_layers, hidden_size]}
+        valid_arrays: {scope: np.ndarray [n_layers] bool}
+        pair_meta:    dict with metadata fields
     """
-    # Explicit truncation policy: 2048 tokens matches the default context length used in
-    # other stage scripts and prevents silent OOM errors on long prompts.
-    inputs = tok(prompt, return_tensors="pt", truncation=True, max_length=2048).to(device)
-    input_ids = inputs["input_ids"][0].tolist()
-    out = model(**inputs, output_hidden_states=True)
-    # Move everything to CPU and cast to float32 immediately to keep GPU memory free
-    hidden_states = [h.detach().float().cpu() for h in out.hidden_states]
-    return hidden_states, input_ids
+    # Tokenize both prompts (CPU only)
+    enc_orig = tok(pair["orig_prompt"], return_tensors="pt",
+                   truncation=True, max_length=TRUNCATION_MAX_LENGTH)
+    enc_cf = tok(pair["cf_prompt"], return_tensors="pt",
+                 truncation=True, max_length=TRUNCATION_MAX_LENGTH)
+    orig_ids = enc_orig["input_ids"][0].tolist()
+    cf_ids = enc_cf["input_ids"][0].tolist()
+
+    # Edit span detection
+    edit_start, edit_end_orig, edit_end_cf, fallback = find_edited_span(orig_ids, cf_ids)
+
+    # Pre-compute per-scope validity (uniform across all layers for a given scope)
+    scope_valid: dict[str, bool] = {}
+    for sc in scopes:
+        if fallback and sc in _SPAN_SCOPES:
+            scope_valid[sc] = False
+        elif sc == "prefix_mean" and edit_start < min_prefix_tokens:
+            scope_valid[sc] = False
+        elif sc == "suffix_mean":
+            if (len(orig_ids) - edit_end_orig < min_suffix_tokens or
+                    len(cf_ids) - edit_end_cf < min_suffix_tokens):
+                scope_valid[sc] = False
+            else:
+                scope_valid[sc] = True
+        else:
+            scope_valid[sc] = True
+
+    # ---- Forward ORIG: pool layer-by-layer, free GPU tensors incrementally ----
+    enc_orig_gpu = {k: v.to(device) for k, v in enc_orig.items()}
+    del enc_orig
+
+    with torch.inference_mode():
+        out = model(**enc_orig_gpu, output_hidden_states=True)
+
+    hs_list = list(out.hidden_states)
+    n_layers = len(hs_list)
+    hidden_size = hs_list[0].shape[-1]
+    del out, enc_orig_gpu
+
+    orig_pooled = {sc: np.zeros((n_layers, hidden_size), dtype=np.float32) for sc in scopes}
+
+    for layer_idx in range(n_layers):
+        h = hs_list[layer_idx].detach().float().cpu()
+        hs_list[layer_idx] = None  # release GPU tensor
+        for sc in scopes:
+            if scope_valid[sc]:
+                orig_pooled[sc][layer_idx] = pool_hidden(
+                    h, sc, edit_start, edit_end_orig, window_radius)
+        del h
+    del hs_list
+
+    # ---- Forward CF: same approach ----
+    enc_cf_gpu = {k: v.to(device) for k, v in enc_cf.items()}
+    del enc_cf
+
+    with torch.inference_mode():
+        out = model(**enc_cf_gpu, output_hidden_states=True)
+
+    hs_list = list(out.hidden_states)
+    del out, enc_cf_gpu
+
+    cf_pooled = {sc: np.zeros((n_layers, hidden_size), dtype=np.float32) for sc in scopes}
+
+    for layer_idx in range(n_layers):
+        h = hs_list[layer_idx].detach().float().cpu()
+        hs_list[layer_idx] = None
+        for sc in scopes:
+            if scope_valid[sc]:
+                cf_pooled[sc][layer_idx] = pool_hidden(
+                    h, sc, edit_start, edit_end_cf, window_radius)
+        del h
+    del hs_list
+
+    # Build validity arrays
+    valid_arrays = {sc: np.full(n_layers, scope_valid[sc], dtype=bool) for sc in scopes}
+
+    # Build pair metadata
+    pair_meta = {
+        "pair_key":       make_pair_key(pair),
+        "qid":            pair["qid"],
+        "family":         pair["family"],
+        "attr_val":       pair["attr_val"],
+        "attr_val_orig":  pair["attr_val_orig"],
+        "attr_norm":      pair["attr_norm"],
+        "gold":           pair["gold"],
+        "split_label":    (orientation_split_label(pair["attr_norm"])
+                           if pair["family"] == "sexual_orientation" else ""),
+        "edit_start":     int(edit_start),
+        "edit_end_orig":  int(edit_end_orig),
+        "edit_end_cf":    int(edit_end_cf),
+        "edit_fallback":  int(fallback),
+        "n_hidden_states": n_layers,
+        "status":         "extracted",
+    }
+
+    return orig_pooled, cf_pooled, valid_arrays, pair_meta
 
 
-def extract_features(
-    model,
-    tok,
-    pairs:         list[dict],
-    device:        str,
-    scopes:        list[str],
-    window_radius: int = 2,
-    min_prefix_tokens: int = 2,
-    min_suffix_tokens: int = 2,
-) -> list[dict]:
-    """Run forward passes and pool hidden states for every pair.
+# ---------------------------------------------------------------------------
+# Chunk I/O
+# ---------------------------------------------------------------------------
 
-    Returns list of records, one per pair:
-      qid, family, attr_val, attr_val_orig, attr_norm, gold, split_label,
-      edit_start, edit_end_orig, edit_end_cf, edit_fallback,
-      n_hidden_states,   <- len(hidden_states) = n_transformer_layers + 1 (embedding)
-      orig_feats: {scope: {layer_idx: np.ndarray | None}},
-      cf_feats:   {scope: {layer_idx: np.ndarray | None}},
+def _flush_chunk_to_disk(
+    cache_dir: Path, chunk_id: str, scopes: list[str],
+    buf_orig: dict[str, list], buf_cf: dict[str, list],
+    buf_valid: dict[str, list],
+):
+    """Atomically write a chunk of pooled features to disk as .npz."""
+    arrays = {}
+    for sc in scopes:
+        arrays[f"orig_{sc}"] = np.array(buf_orig[sc], dtype=np.float32)
+        arrays[f"cf_{sc}"] = np.array(buf_cf[sc], dtype=np.float32)
+        arrays[f"valid_{sc}"] = np.array(buf_valid[sc], dtype=bool)
 
-    For span scopes when fallback=True, every layer is stored as None.
-    For prefix_mean/suffix_mean, None is stored if the prefix/suffix is too short.
+    chunk_path = cache_dir / "chunks" / f"{chunk_id}.npz"
+    tmp_fd, tmp_path = tempfile.mkstemp(
+        suffix=".npz.tmp", dir=cache_dir / "chunks")
+    os.close(tmp_fd)
+    try:
+        np.savez(tmp_path, **arrays)
+        os.rename(tmp_path, str(chunk_path))  # atomic on POSIX
+    except BaseException:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
+
+
+_PAIR_INDEX_FIELDS = [
+    "pair_key", "qid", "family", "attr_val", "attr_val_orig", "attr_norm",
+    "gold", "split_label", "edit_start", "edit_end_orig", "edit_end_cf",
+    "edit_fallback", "n_hidden_states", "chunk_id", "status",
+]
+_PAIR_INDEX_INT_FIELDS = {"edit_start", "edit_end_orig", "edit_end_cf",
+                          "edit_fallback", "n_hidden_states"}
+
+
+def _save_pair_index(cache_dir: Path, entries: list[dict]):
+    path = cache_dir / "pair_index.csv"
+    if not entries:
+        return
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".csv.tmp", dir=cache_dir)
+    os.close(tmp_fd)
+    try:
+        with open(tmp_path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=_PAIR_INDEX_FIELDS, extrasaction="ignore")
+            w.writeheader()
+            w.writerows(entries)
+        os.rename(tmp_path, str(path))
+    except BaseException:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
+
+
+def _load_pair_index(cache_dir: Path) -> list[dict]:
+    path = cache_dir / "pair_index.csv"
+    if not path.exists():
+        return []
+    with open(path) as f:
+        reader = csv.DictReader(f)
+        entries = list(reader)
+    for e in entries:
+        for field in _PAIR_INDEX_INT_FIELDS:
+            val = e.get(field, "")
+            if val != "":
+                try:
+                    e[field] = int(val)
+                except (ValueError, TypeError):
+                    pass
+    return entries
+
+
+def load_scope_from_cache(
+    cache_dir: Path, scope: str, manifest: dict,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Load all cached data for one scope across all chunks.
+
+    Returns:
+        orig:  [n_pairs, n_layers, hidden_size] float32
+        cf:    [n_pairs, n_layers, hidden_size] float32
+        valid: [n_pairs, n_layers] bool
     """
-    results = []
-    n = len(pairs)
-    print(f"  Extracting features: {n} pairs, scopes={scopes}")
+    orig_parts, cf_parts, valid_parts = [], [], []
+    for chunk_info in manifest["chunks"]:
+        chunk_path = cache_dir / chunk_info["file"]
+        data = np.load(chunk_path)
+        orig_parts.append(data[f"orig_{scope}"])
+        cf_parts.append(data[f"cf_{scope}"])
+        valid_parts.append(data[f"valid_{scope}"])
+        data.close()
 
-    for i, pair in enumerate(pairs):
-        if (i + 1) % 25 == 0 or i == n - 1:
-            print(f"    {i + 1}/{n}", end="\r", flush=True)
+    if not orig_parts:
+        raise ValueError(f"No chunk data found for scope '{scope}'")
 
+    return (
+        np.concatenate(orig_parts, axis=0),
+        np.concatenate(cf_parts, axis=0),
+        np.concatenate(valid_parts, axis=0),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Extraction phase
+# ---------------------------------------------------------------------------
+
+def run_extraction_phase(
+    model, tok, pairs: list[dict], device: str,
+    cache_dir: Path, scopes: list[str], chunk_size: int,
+    window_radius: int, min_prefix_tokens: int, min_suffix_tokens: int,
+    force_reextract: bool,
+):
+    """Phase A: extract pooled features for all pairs with chunking and resume."""
+    n_layers = model.config.num_hidden_layers + 1
+    hidden_size = model.config.hidden_size
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    (cache_dir / "chunks").mkdir(exist_ok=True)
+
+    # ---- Load existing cache state for resume ----
+    completed_keys: set[str] = set()
+    existing_pair_entries: list[dict] = []
+    existing_chunks: list[dict] = []
+
+    manifest_path = cache_dir / "cache_manifest.json"
+
+    if force_reextract:
+        chunks_dir = cache_dir / "chunks"
+        if chunks_dir.exists():
+            for f in chunks_dir.glob("*.npz"):
+                f.unlink()
+        for cleanup_file in [manifest_path, cache_dir / "pair_index.csv"]:
+            if cleanup_file.exists():
+                cleanup_file.unlink()
+        print("  Force re-extract: cleared existing cache.")
+
+    elif manifest_path.exists():
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+        cached_scopes = set(manifest.get("scopes", []))
+        requested_scopes = set(scopes)
+        if not requested_scopes.issubset(cached_scopes):
+            missing = requested_scopes - cached_scopes
+            print(f"  ERROR: requested scopes {sorted(missing)} not in cache "
+                  f"(cached: {sorted(cached_scopes)})")
+            print("  Use --force_reextract to rebuild cache with new scopes.")
+            raise SystemExit(1)
+        existing_chunks = manifest.get("chunks", [])
+
+        pair_index_path = cache_dir / "pair_index.csv"
+        if pair_index_path.exists():
+            existing_pair_entries = _load_pair_index(cache_dir)
+            completed_keys = {
+                e["pair_key"] for e in existing_pair_entries
+                if e.get("status") == "extracted"
+            }
+
+    # ---- Determine remaining pairs ----
+    all_keyed = [(make_pair_key(p), p) for p in pairs]
+    remaining = [(k, p) for k, p in all_keyed if k not in completed_keys]
+
+    n_total = len(all_keyed)
+    n_cached = n_total - len(remaining)
+
+    print(f"  Extraction: {n_total} total, {n_cached} cached, "
+          f"{len(remaining)} to extract (chunk_size={chunk_size})")
+
+    if not remaining:
+        print("  All pairs already extracted. Skipping extraction.")
+        return
+
+    # ---- Extraction loop ----
+    chunk_id_counter = len(existing_chunks)
+    new_pair_entries: list[dict] = []
+    new_chunks: list[dict] = []
+    n_failed = 0
+
+    buf_metas: list[dict] = []
+    buf_orig: dict[str, list] = {sc: [] for sc in scopes}
+    buf_cf: dict[str, list] = {sc: [] for sc in scopes}
+    buf_valid: dict[str, list] = {sc: [] for sc in scopes}
+
+    start_time = time.time()
+
+    for idx, (pair_key, pair) in enumerate(remaining):
         try:
-            orig_hs, orig_ids = _run_forward(model, tok, pair["orig_prompt"], device)
-            cf_hs,   cf_ids   = _run_forward(model, tok, pair["cf_prompt"],   device)
+            orig_pooled, cf_pooled, valid_arrays, pair_meta = extract_single_pair(
+                model, tok, pair, device, scopes,
+                window_radius=window_radius,
+                min_prefix_tokens=min_prefix_tokens,
+                min_suffix_tokens=min_suffix_tokens,
+            )
         except Exception as exc:
-            print(f"\n    Warning: forward pass failed pair {i} qid={pair['qid']}: {exc}")
+            print(f"\n    WARN: pair failed qid={pair.get('qid')} "
+                  f"family={pair.get('family')}: {exc}")
+            new_pair_entries.append({
+                "pair_key": pair_key, "qid": pair["qid"],
+                "family": pair["family"], "attr_val": pair["attr_val"],
+                "attr_val_orig": pair.get("attr_val_orig", ""),
+                "attr_norm": pair.get("attr_norm", ""),
+                "gold": pair.get("gold", ""),
+                "split_label": "", "edit_start": "", "edit_end_orig": "",
+                "edit_end_cf": "", "edit_fallback": "", "n_hidden_states": "",
+                "chunk_id": "", "status": "failed",
+            })
+            n_failed += 1
             continue
 
-        edit_start, edit_end_orig, edit_end_cf, fallback = find_edited_span(orig_ids, cf_ids)
-        n_hs = len(orig_hs)  # includes embedding at index 0
+        buf_metas.append(pair_meta)
+        for sc in scopes:
+            buf_orig[sc].append(orig_pooled[sc])
+            buf_cf[sc].append(cf_pooled[sc])
+            buf_valid[sc].append(valid_arrays[sc])
 
-        orig_feats: dict = {sc: {} for sc in scopes}
-        cf_feats:   dict = {sc: {} for sc in scopes}
+        del orig_pooled, cf_pooled, valid_arrays
 
-        for layer_idx in range(n_hs):
-            for sc in scopes:
-                # Req 5: span scopes → None when fallback
-                if fallback and sc in _SPAN_SCOPES:
-                    orig_feats[sc][layer_idx] = None
-                    cf_feats[sc][layer_idx]   = None
-                    continue
+        # ---- Flush when chunk is full ----
+        if len(buf_metas) >= chunk_size:
+            chunk_id = f"chunk_{chunk_id_counter:05d}"
+            _flush_chunk_to_disk(cache_dir, chunk_id, scopes,
+                                 buf_orig, buf_cf, buf_valid)
 
-                # Req 6: min prefix/suffix token checks
-                if sc == "prefix_mean":
-                    if edit_start < min_prefix_tokens:
-                        orig_feats[sc][layer_idx] = None
-                        cf_feats[sc][layer_idx]   = None
-                        continue
-                elif sc == "suffix_mean":
-                    orig_suffix_len = len(orig_ids) - edit_end_orig
-                    cf_suffix_len   = len(cf_ids)   - edit_end_cf
-                    if orig_suffix_len < min_suffix_tokens or cf_suffix_len < min_suffix_tokens:
-                        orig_feats[sc][layer_idx] = None
-                        cf_feats[sc][layer_idx]   = None
-                        continue
+            for meta in buf_metas:
+                meta["chunk_id"] = chunk_id
+                new_pair_entries.append(meta)
 
-                orig_feats[sc][layer_idx] = pool_hidden(
-                    orig_hs[layer_idx], sc, edit_start, edit_end_orig, window_radius)
-                cf_feats[sc][layer_idx] = pool_hidden(
-                    cf_hs[layer_idx], sc, edit_start, edit_end_cf, window_radius)
+            new_chunks.append({
+                "chunk_id": chunk_id,
+                "file": f"chunks/{chunk_id}.npz",
+                "n_pairs": len(buf_metas),
+            })
 
-        results.append({
-            "qid":           pair["qid"],
-            "family":        pair["family"],
-            "attr_val":      pair["attr_val"],
-            "attr_val_orig": pair["attr_val_orig"],
-            "attr_norm":     pair["attr_norm"],
-            "gold":          pair["gold"],
-            "split_label":   (orientation_split_label(pair["attr_norm"])
-                              if pair["family"] == "sexual_orientation" else None),
-            "edit_start":    edit_start,
-            "edit_end_orig": edit_end_orig,
-            "edit_end_cf":   edit_end_cf,
-            "edit_fallback": fallback,
-            "n_hidden_states": n_hs,
-            "orig_feats":    orig_feats,
-            "cf_feats":      cf_feats,
+            # Reset buffers
+            buf_metas = []
+            buf_orig = {sc: [] for sc in scopes}
+            buf_cf = {sc: [] for sc in scopes}
+            buf_valid = {sc: [] for sc in scopes}
+            chunk_id_counter += 1
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+
+            elapsed = time.time() - start_time
+            done = idx + 1
+            rate = done / elapsed if elapsed > 0 else 0
+            eta = (len(remaining) - done) / rate if rate > 0 else 0
+            print(f"    Flushed {chunk_id} | {done}/{len(remaining)} pairs | "
+                  f"{elapsed:.0f}s elapsed | ~{eta:.0f}s remaining")
+
+        elif (idx + 1) % 10 == 0:
+            elapsed = time.time() - start_time
+            print(f"    {idx + 1}/{len(remaining)} pairs ({elapsed:.0f}s)...",
+                  end="\r", flush=True)
+
+    # ---- Flush remaining ----
+    if buf_metas:
+        chunk_id = f"chunk_{chunk_id_counter:05d}"
+        _flush_chunk_to_disk(cache_dir, chunk_id, scopes,
+                             buf_orig, buf_cf, buf_valid)
+        for meta in buf_metas:
+            meta["chunk_id"] = chunk_id
+            new_pair_entries.append(meta)
+        new_chunks.append({
+            "chunk_id": chunk_id,
+            "file": f"chunks/{chunk_id}.npz",
+            "n_pairs": len(buf_metas),
         })
+        print(f"    Flushed final {chunk_id} ({len(buf_metas)} pairs)")
 
-    print()  # newline after \r progress
-    return results
+    del buf_metas, buf_orig, buf_cf, buf_valid
+    gc.collect()
+
+    # ---- Save updated cache index ----
+    all_pair_entries = existing_pair_entries + new_pair_entries
+    all_chunks = existing_chunks + new_chunks
+
+    _save_pair_index(cache_dir, all_pair_entries)
+
+    n_extracted = sum(1 for e in all_pair_entries if e.get("status") == "extracted")
+    n_total_failed = sum(1 for e in all_pair_entries if e.get("status") == "failed")
+
+    manifest_data = {
+        "scopes": list(scopes),
+        "n_layers": n_layers,
+        "hidden_size": hidden_size,
+        "chunk_size": chunk_size,
+        "truncation_max_length": TRUNCATION_MAX_LENGTH,
+        "total_pairs_extracted": n_extracted,
+        "total_pairs_failed": n_total_failed,
+        "chunks": all_chunks,
+        "resumed_from_cache": n_cached > 0,
+    }
+    save_json(manifest_data, cache_dir / "cache_manifest.json")
+
+    elapsed = time.time() - start_time
+    print(f"\n  Extraction complete: {n_extracted} extracted, "
+          f"{n_total_failed} failed, {elapsed:.1f}s total")
 
 
 # ---------------------------------------------------------------------------
-# Probe dataset builders
+# Deterministic qid grouping
 # ---------------------------------------------------------------------------
 
 def _qid_group(qid: str) -> int:
-    """Deterministic integer group id from a qid string.
-
-    Uses MD5 so the result is stable across Python processes and platforms,
-    regardless of PYTHONHASHSEED. Two runs with identical qids will always
-    produce the same group assignments.
-    """
     return int(hashlib.md5(qid.encode()).hexdigest(), 16) % (2 ** 31)
 
 
-def build_orig_vs_cf(
-    bank: list[dict], family: str, scope: str, layer: int,
+# ---------------------------------------------------------------------------
+# Probe dataset builders (cache-backed, per-layer arrays)
+# ---------------------------------------------------------------------------
+
+def _build_orig_vs_cf(
+    metas: list[dict],
+    orig_l: np.ndarray,   # [n_pairs, hidden_size]
+    cf_l:   np.ndarray,
+    valid_l: np.ndarray,  # [n_pairs] bool
+    family: str,
 ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
     """Task A — binary: orig (0) vs CF (1) for one family."""
     X, y, groups = [], [], []
-    for r in bank:
-        if r["family"] != family:
+    for i, m in enumerate(metas):
+        if m["family"] != family:
             continue
-        o = r["orig_feats"].get(scope, {}).get(layer)
-        c = r["cf_feats"].get(scope, {}).get(layer)
-        if o is None or c is None:
+        if not valid_l[i]:
             continue
-        grp = _qid_group(r["qid"])
-        X.extend([o, c])
+        grp = _qid_group(m["qid"])
+        X.append(orig_l[i])
+        X.append(cf_l[i])
         y.extend([0, 1])
         groups.extend([grp, grp])
     if not X:
         return None, None, None
-    return np.array(X), np.array(y), np.array(groups)
+    return np.stack(X), np.array(y), np.array(groups)
 
 
-def build_family_identity(
-    bank: list[dict], families: list[str], scope: str, layer: int,
+def _build_family_identity(
+    metas: list[dict],
+    cf_l:    np.ndarray,
+    valid_l: np.ndarray,
+    families: list[str],
 ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None, list[str]]:
     """Task B — multiclass: CF only, label by family."""
     label_map = {f: i for i, f in enumerate(families)}
     X, y, groups = [], [], []
-    for r in bank:
-        if r["family"] not in label_map:
+    for i, m in enumerate(metas):
+        if m["family"] not in label_map:
             continue
-        c = r["cf_feats"].get(scope, {}).get(layer)
-        if c is None:
+        if not valid_l[i]:
             continue
-        X.append(c)
-        y.append(label_map[r["family"]])
-        groups.append(_qid_group(r["qid"]))
+        X.append(cf_l[i])
+        y.append(label_map[m["family"]])
+        groups.append(_qid_group(m["qid"]))
     if not X:
         return None, None, None, families
-    return np.array(X), np.array(y), np.array(groups), families
+    return np.stack(X), np.array(y), np.array(groups), families
 
 
-def build_within_family_attribute(
-    bank:           list[dict],
-    family:         str,
-    scope:          str,
-    layer:          int,
-    min_examples:   int = 20,
+def _build_within_family_attribute(
+    metas:     list[dict],
+    cf_l:      np.ndarray,
+    valid_l:   np.ndarray,
+    family:    str,
+    min_examples: int,
     exclude_labels: list[str] | None = None,
 ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None, list[str], list[str]]:
-    """Task C — multiclass: CF only, label by attr_val within one family.
-    Returns (X, y, groups, retained_classes, dropped_classes).
-    exclude_labels: labels to remove before counting retained/dropped.
-    """
+    """Task C — multiclass: CF only, label by attr_val within one family."""
     excl = set(exclude_labels or [])
-    fam_records = [r for r in bank if r["family"] == family and r["attr_val"] not in excl]
-    counts = Counter(r["attr_val"] for r in fam_records)
+    fam_indices = [(i, m) for i, m in enumerate(metas)
+                   if m["family"] == family and m["attr_val"] not in excl]
+    counts = Counter(m["attr_val"] for _, m in fam_indices)
     all_classes = sorted(counts.items())
     retained = [cls for cls, cnt in all_classes if cnt >= min_examples]
-    dropped  = [cls for cls, cnt in all_classes if cnt < min_examples]
+    dropped = [cls for cls, cnt in all_classes if cnt < min_examples]
     if len(retained) < 2:
         return None, None, None, retained, dropped
 
     label_map = {cls: i for i, cls in enumerate(retained)}
     X, y, groups = [], [], []
-    for r in fam_records:
-        if r["attr_val"] not in label_map:
+    for i, m in fam_indices:
+        if m["attr_val"] not in label_map:
             continue
-        c = r["cf_feats"].get(scope, {}).get(layer)
-        if c is None:
+        if not valid_l[i]:
             continue
-        X.append(c)
-        y.append(label_map[r["attr_val"]])
-        groups.append(_qid_group(r["qid"]))
+        X.append(cf_l[i])
+        y.append(label_map[m["attr_val"]])
+        groups.append(_qid_group(m["qid"]))
     if not X:
         return None, None, None, retained, dropped
-    return np.array(X), np.array(y), np.array(groups), retained, dropped
+    return np.stack(X), np.array(y), np.array(groups), retained, dropped
 
 
-def build_context_split(
-    bank: list[dict], scope: str, layer: int,
+def _build_context_split(
+    metas: list[dict],
+    cf_l:    np.ndarray,
+    valid_l: np.ndarray,
 ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None, int]:
-    """Task D — binary: partner (0) vs explicit (1) for sexual_orientation.
-    Returns (X, y, groups, n_other_dropped).
-    """
-    so_records = [r for r in bank if r["family"] == "sexual_orientation"]
-    n_other = sum(1 for r in so_records if r.get("split_label") == "other")
+    """Task D — binary: partner (0) vs explicit (1) for sexual_orientation."""
+    so_indices = [(i, m) for i, m in enumerate(metas)
+                  if m["family"] == "sexual_orientation"]
+    n_other = sum(1 for _, m in so_indices if m.get("split_label") == "other")
     label_map = {"partner": 0, "explicit": 1}
     X, y, groups = [], [], []
-    for r in so_records:
-        lbl = r.get("split_label")
+    for i, m in so_indices:
+        lbl = m.get("split_label", "")
         if lbl not in label_map:
             continue
-        c = r["cf_feats"].get(scope, {}).get(layer)
-        if c is None:
+        if not valid_l[i]:
             continue
-        X.append(c)
+        X.append(cf_l[i])
         y.append(label_map[lbl])
-        groups.append(_qid_group(r["qid"]))
+        groups.append(_qid_group(m["qid"]))
     if not X:
         return None, None, None, n_other
-    return np.array(X), np.array(y), np.array(groups), n_other
+    return np.stack(X), np.array(y), np.array(groups), n_other
 
 
-def build_focal_vs_control_cf(
-    bank: list[dict], focal_family: str, scope: str, layer: int,
+def _build_focal_vs_control_cf(
+    metas: list[dict],
+    cf_l:    np.ndarray,
+    valid_l: np.ndarray,
+    focal_family: str,
 ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
-    """Task E — Binary: focal CF (1) vs control CF (0). Returns None if no control pairs."""
+    """Task E — binary: focal CF (1) vs control CF (0)."""
     X, y, groups = [], [], []
-    for r in bank:
-        if r["family"] == focal_family:
-            c = r["cf_feats"].get(scope, {}).get(layer)
-            if c is None:
-                continue
-            X.append(c)
-            y.append(1)
-            groups.append(_qid_group(r["qid"]))
-        elif r["family"] == "control":
-            c = r["cf_feats"].get(scope, {}).get(layer)
-            if c is None:
-                continue
-            X.append(c)
-            y.append(0)
-            groups.append(_qid_group(r["qid"]))
+    for i, m in enumerate(metas):
+        if m["family"] == focal_family:
+            label = 1
+        elif m["family"] == "control":
+            label = 0
+        else:
+            continue
+        if not valid_l[i]:
+            continue
+        X.append(cf_l[i])
+        y.append(label)
+        groups.append(_qid_group(m["qid"]))
     if not X or len(set(y)) < 2:
         return None, None, None
-    return np.array(X), np.array(y), np.array(groups)
+    return np.stack(X), np.array(y), np.array(groups)
 
 
 # ---------------------------------------------------------------------------
@@ -753,14 +1052,11 @@ def grouped_split(
     test_size: float,
     seed: int,
 ) -> tuple[np.ndarray, np.ndarray, str]:
-    """GroupShuffleSplit by qid; falls back to StratifiedShuffleSplit when groups are too few."""
     unique_groups = np.unique(groups)
     if len(unique_groups) >= 4:
         gss = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
         train_idx, test_idx = next(gss.split(X, y, groups=groups))
         return train_idx, test_idx, "group_shuffle"
-
-    # Fallback: stratified (may still fail for single-class splits)
     try:
         sss = StratifiedShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
         train_idx, test_idx = next(sss.split(X, y))
@@ -781,21 +1077,19 @@ def fit_probe(
     groups: np.ndarray,
     test_size: float,
     seed: int,
-    task_type: str,            # "binary" or "multiclass"
+    task_type: str,
     label_names: list[str] | None = None,
     max_iter: int = 1000,
     balance_classes: bool = False,
     probe_C: float = 1.0,
-    probe_class_weight=None,   # None or "balanced"
+    probe_class_weight=None,
 ) -> dict:
-    """Fit a StandardScaler + LogisticRegression pipeline and return metrics."""
     unique_classes = np.unique(y)
     if len(unique_classes) < 2:
         return {"error": "single_class", "n_examples": int(len(y))}
 
     train_idx, test_idx, splitter = grouped_split(X, y, groups, test_size, seed)
 
-    # Req 3: validate split
     y_train_pre = y[train_idx]
     y_test_pre  = y[test_idx]
     err = validate_split(y_train_pre, y_test_pre)
@@ -805,7 +1099,6 @@ def fit_probe(
     X_train, X_test = X[train_idx], X[test_idx]
     y_train, y_test = y_train_pre, y_test_pre
 
-    # Req 2: balance training set if requested
     if balance_classes:
         X_train, y_train = balance_training_set(X_train, y_train, seed)
 
@@ -831,7 +1124,6 @@ def fit_probe(
 
     y_pred = pipe.predict(X_test)
 
-    # Req 9: compute baselines
     train_counts = Counter(y_train.tolist())
     majority_class = max(train_counts, key=train_counts.get)
     majority_baseline_accuracy = float(train_counts[majority_class] / len(y_train))
@@ -877,7 +1169,6 @@ def fit_probe(
         metrics["macro_f1"]    = float(f1_score(y_test, y_pred, average="macro",    zero_division=0))
         metrics["weighted_f1"] = float(f1_score(y_test, y_pred, average="weighted", zero_division=0))
 
-    # Confusion matrix (stored separately, not in the flat CSV)
     all_labels = list(range(len(label_names))) if label_names else list(range(len(unique_classes)))
     metrics["_confusion_matrix"] = confusion_matrix(y_test, y_pred, labels=all_labels).tolist()
     metrics["_label_names"]      = label_names
@@ -886,11 +1177,14 @@ def fit_probe(
 
 
 # ---------------------------------------------------------------------------
-# Per-layer probe sweep
+# Per-layer probe sweep (cache-backed)
 # ---------------------------------------------------------------------------
 
-def run_layerwise_probe(
-    bank:            list[dict],
+def run_layerwise_probe_cached(
+    pair_metas:      list[dict],
+    orig_scope:      np.ndarray,
+    cf_scope:        np.ndarray,
+    valid_scope:     np.ndarray,
     task:            str,
     scope:           str,
     family:          str | None,
@@ -905,10 +1199,13 @@ def run_layerwise_probe(
     probe_class_weight=None,
     within_family_exclude_labels: list[str] | None = None,
 ) -> list[dict]:
-    """Run the probe at every layer and return a list of per-layer result dicts."""
+    """Run the probe at every layer using cached arrays."""
     rows = []
     for layer in range(n_hidden_states):
-        # Req 7: layer indexing clarity
+        orig_l = orig_scope[:, layer, :]
+        cf_l = cf_scope[:, layer, :]
+        valid_l = valid_scope[:, layer]
+
         base = {
             "layer":                     layer,
             "layer_index":               layer,
@@ -919,22 +1216,22 @@ def run_layerwise_probe(
             "family":                    family or "global",
         }
 
-        # ----- Build X, y, groups -----
         if task == "orig_vs_cf":
-            X, y, groups = build_orig_vs_cf(bank, family, scope, layer)
+            X, y, groups = _build_orig_vs_cf(
+                pair_metas, orig_l, cf_l, valid_l, family)
             task_type = "binary"
             label_names = ["orig", "cf"]
             extra = {}
 
         elif task == "family_identity":
-            X, y, groups, label_names = build_family_identity(
-                bank, families_global, scope, layer)
+            X, y, groups, label_names = _build_family_identity(
+                pair_metas, cf_l, valid_l, families_global)
             task_type = "multiclass"
             extra = {}
 
         elif task == "within_family_attribute":
-            X, y, groups, retained, dropped = build_within_family_attribute(
-                bank, family, scope, layer, min_examples_per_class,
+            X, y, groups, retained, dropped = _build_within_family_attribute(
+                pair_metas, cf_l, valid_l, family, min_examples_per_class,
                 exclude_labels=within_family_exclude_labels)
             task_type = "multiclass"
             label_names = retained
@@ -944,13 +1241,15 @@ def run_layerwise_probe(
                 continue
 
         elif task == "context_split":
-            X, y, groups, n_other = build_context_split(bank, scope, layer)
+            X, y, groups, n_other = _build_context_split(
+                pair_metas, cf_l, valid_l)
             task_type = "binary"
             label_names = ["partner", "explicit"]
             extra = {"n_other_dropped": n_other}
 
         elif task == "focal_vs_control_cf":
-            X, y, groups = build_focal_vs_control_cf(bank, family, scope, layer)
+            X, y, groups = _build_focal_vs_control_cf(
+                pair_metas, cf_l, valid_l, family)
             task_type = "binary"
             label_names = ["control", "focal"]
             extra = {}
@@ -971,12 +1270,10 @@ def run_layerwise_probe(
             probe_class_weight=probe_class_weight,
         )
 
-        # Flatten: exclude internal _keys from the row dict
         row = {**base, **extra,
                **{k: v for k, v in metrics.items() if not k.startswith("_")}}
         row["_confusion_matrix"] = metrics.get("_confusion_matrix")
         row["_label_names"]      = metrics.get("_label_names")
-        # Req 22: derived convenience field for CSV (backward compat)
         row["f1_or_macro_f1"] = row.get("f1") if row.get("f1") is not None else row.get("macro_f1")
         rows.append(row)
 
@@ -1005,7 +1302,6 @@ def save_json(obj: object, path: Path):
         json.dump(_js(obj), f, indent=2)
 
 
-# Req 22: updated CSV columns
 _CSV_COLS = [
     "layer", "layer_index", "layer_type", "transformer_layer_number",
     "feature_scope", "task", "family",
@@ -1043,12 +1339,8 @@ def save_confusion_matrix(cm: list[list], labels: list[str], path: Path):
 
 
 def save_experiment(exp_dir: Path, metadata: dict, per_layer_rows: list[dict]):
-    """Write metadata.json and per_layer.csv for one experiment.
-    Also saves confusion_matrix.csv at the peak balanced_accuracy layer.
-    """
     exp_dir.mkdir(parents=True, exist_ok=True)
 
-    # Req 21: auto-inject standard fields
     metadata.setdefault("script",  SCRIPT_NAME)
     metadata.setdefault("version", VERSION)
     metadata.setdefault("layer_0_is_embedding", True)
@@ -1064,7 +1356,6 @@ def save_experiment(exp_dir: Path, metadata: dict, per_layer_rows: list[dict]):
     save_json(metadata, exp_dir / "metadata.json")
     save_csv(per_layer_rows, exp_dir / "per_layer.csv")
 
-    # Confusion matrix at peak layer
     peak_row = None
     for r in per_layer_rows:
         if r.get("_confusion_matrix") is None:
@@ -1081,7 +1372,6 @@ def save_experiment(exp_dir: Path, metadata: dict, per_layer_rows: list[dict]):
 
 
 def summarize_layers(rows: list[dict], metric: str = "balanced_accuracy") -> dict:
-    """Return peak layer, peak value, and mean value for one experiment."""
     valid = [(r["layer"], r[metric]) for r in rows
              if r.get(metric) is not None and not r.get("error")]
     if not valid:
@@ -1098,14 +1388,6 @@ def summarize_layers(rows: list[dict], metric: str = "balanced_accuracy") -> dic
 
 
 def _task_sample_summary(rows: list[dict], metric: str = "balanced_accuracy") -> dict:
-    """Summarise n_examples/n_train/n_test across all valid probe layers.
-
-    Peak layer is identified by `metric` (default: balanced_accuracy). The returned
-    dict records which metric was used so the summary is self-describing.
-    Reflects actual layer-by-layer variation rather than silently assuming uniform
-    counts (counts can differ when span-scope features are omitted at some layers).
-    Returns {} if there are no valid rows.
-    """
     valid = [r for r in rows if not r.get("error") and r.get("n_examples") is not None]
     if not valid:
         return {}
@@ -1138,7 +1420,6 @@ _LINE_KW  = {"linewidth": 1.8, "alpha": 0.9}
 
 
 def _add_embed_layer1_separator(ax):
-    """Add vertical line at x=0.5 separating embedding from transformer layers."""
     ax.axvline(x=0.5, color="grey", linewidth=0.8, linestyle=":", alpha=0.6, label="embed|L1")
 
 
@@ -1150,12 +1431,11 @@ def _ax_layer_ticks(ax, n_layers: int):
 
 
 def plot_orig_vs_cf_curves(
-    results_by_family: dict,      # family → list[dict] of per_layer rows
+    results_by_family: dict,
     scope:             str,
     output_path:       Path,
     metric:            str = "balanced_accuracy",
 ):
-    """Plot A: one line per family showing orig-vs-cf decodability across layers."""
     fig, ax = plt.subplots(figsize=(10, 5), dpi=_PLOT_DPI)
     ax.axhline(0.5, color="black", linewidth=1, linestyle="--", alpha=0.4, label="chance (0.5)")
     _add_embed_layer1_separator(ax)
@@ -1170,7 +1450,6 @@ def plot_orig_vs_cf_curves(
         max_layer = max(max_layer, max(layers))
 
     ax.set_ylabel(metric.replace("_", " ").title())
-    # Req 4 & 20: title prefix for orig_vs_cf
     ax.set_title(
         f"Manipulation Detectability (orig vs CF)  |  scope: {scope}\n"
         f"Note: Stage 3 edit-mass peaks were early for gender_identity and race."
@@ -1190,7 +1469,6 @@ def plot_family_identity_curve(
     output_path: Path,
     metric:      str = "balanced_accuracy",
 ):
-    """Plot B: family identity decoding curve (global, CF only)."""
     layers = [r["layer"] for r in rows if r.get(metric) is not None]
     vals   = [r[metric]  for r in rows if r.get(metric) is not None]
     if not layers:
@@ -1224,7 +1502,6 @@ def plot_within_family_curves(
     output_path:       Path,
     metric:            str = "balanced_accuracy",
 ):
-    """Plot C: within-family attribute decoding, one subplot per family."""
     valid = {f: rows for f, rows in results_by_family.items()
              if any(r.get(metric) is not None for r in rows)}
     if not valid:
@@ -1271,7 +1548,6 @@ def plot_context_split_curve(
     output_path: Path,
     metric:      str = "balanced_accuracy",
 ):
-    """Plot D: partner vs explicit decodability for sexual orientation."""
     layers = [r["layer"] for r in rows if r.get(metric) is not None]
     vals   = [r[metric]  for r in rows if r.get(metric) is not None]
     if not layers:
@@ -1283,7 +1559,6 @@ def plot_context_split_curve(
     ax.plot(layers, vals, color=FAMILY_COLORS["sexual_orientation"], **_LINE_KW,
             label="partner vs explicit")
     ax.set_ylabel(metric.replace("_", " ").title())
-    # Req 12 & 20: updated title
     ax.set_title(
         f"SO Context Split: Partner-Neutralized vs Explicit-Orientation Variants  |  scope: {scope}\n"
         f"partner-neutralized vs explicit-orientation  "
@@ -1308,10 +1583,6 @@ def plot_summary_heatmap(
     vmin: float = -1.0,
     vmax: float = 1.0,
 ):
-    """Heatmap: rows = (family, task), cols = layers, color = metric value.
-
-    Req 10: accept metric, cmap, vcenter, vmin, vmax parameters.
-    """
     if not all_results:
         return
 
@@ -1373,7 +1644,8 @@ def plot_summary_heatmap(
 def parse_args():
     p = argparse.ArgumentParser(
         description="Stage 4.5: layerwise linear-probe decoding of demographic signal.")
-    p.add_argument("--model_path",  required=True)
+    p.add_argument("--model_path",  default=None,
+                   help="Path to HF model. Not required with --probe_only.")
     p.add_argument("--data_path",   required=True)
     p.add_argument("--output_dir",  required=True)
     p.add_argument("--device",   default="auto")
@@ -1386,52 +1658,45 @@ def parse_args():
                    help="Demographic families to include.")
     p.add_argument("--feature_scope", nargs="+", default=["final_token"],
                    choices=FEATURE_SCOPES,
-                   help="Feature pooling scope(s). All requested scopes are extracted in one pass.")
-    p.add_argument("--window_radius", type=int, default=2,
-                   help="Token window radius for edited_window_mean scope.")
+                   help="Feature pooling scope(s).")
+    p.add_argument("--window_radius", type=int, default=2)
     p.add_argument("--probe_tasks",   nargs="+",
                    default=["orig_vs_cf", "family_identity",
                              "within_family_attribute", "context_split"],
                    choices=["orig_vs_cf", "family_identity",
                              "within_family_attribute", "context_split",
                              "focal_vs_control_cf"])
-    p.add_argument("--min_examples_per_class", type=int, default=20,
-                   help="Minimum examples per class to include in within_family_attribute task.")
+    p.add_argument("--min_examples_per_class", type=int, default=20)
     p.add_argument("--test_size",   type=float, default=0.25)
-    p.add_argument("--n_bootstrap", type=int,   default=0,
-                   help="Bootstrap CI iterations. 0 = disabled (not yet implemented).")
-    p.add_argument("--balance_classes", action="store_true",
-                   help="Undersample majority classes in training split.")
-    p.add_argument("--include_controls", action="store_true",
-                   help="Load control pairs separately for focal_vs_control_cf task.")
-    # Req 8: probe hyperparameters
-    p.add_argument("--probe_C", type=float, default=1.0,
-                   help="Logistic regression C (inverse regularization strength).")
-    p.add_argument("--probe_max_iter", type=int, default=1000,
-                   help="Max iterations for logistic regression solver.")
-    p.add_argument("--probe_class_weight", choices=["none", "balanced"], default="none",
-                   help="Class weight for logistic regression. 'none' = uniform.")
-    # Req 6: min prefix/suffix tokens
-    p.add_argument("--min_prefix_tokens", type=int, default=2,
-                   help="Minimum prefix tokens needed to compute prefix_mean scope.")
-    p.add_argument("--min_suffix_tokens", type=int, default=2,
-                   help="Minimum suffix tokens needed to compute suffix_mean scope.")
-    # Req 11: within_family exclude labels
-    p.add_argument("--within_family_exclude_labels", nargs="*", default=[],
-                   help="Labels to exclude before within_family_attribute class counting.")
+    p.add_argument("--n_bootstrap", type=int,   default=0)
+    p.add_argument("--balance_classes", action="store_true")
+    p.add_argument("--include_controls", action="store_true")
+    p.add_argument("--probe_C", type=float, default=1.0)
+    p.add_argument("--probe_max_iter", type=int, default=1000)
+    p.add_argument("--probe_class_weight", choices=["none", "balanced"], default="none")
+    p.add_argument("--min_prefix_tokens", type=int, default=2)
+    p.add_argument("--min_suffix_tokens", type=int, default=2)
+    p.add_argument("--within_family_exclude_labels", nargs="*", default=[])
     p.add_argument("--so_within_family", action="store_true",
-                   help="Enable within_family_attribute for sexual_orientation. "
-                        "Disabled by default: SO labels mix orientation-identity "
-                        "(gay, straight) and relationship-context (partner) variants, "
-                        "making attribute-level decoding hard to interpret. "
-                        "Only enable if you understand the label heterogeneity.")
-    # Req 19: save_pair_level_metadata (new name) + deprecated alias
+                   help="Enable within_family_attribute for sexual_orientation.")
     p.add_argument("--save_pair_level_metadata", action="store_true",
-                   dest="save_pair_level_metadata",
-                   help="Save per-pair feature metadata CSV (not raw vectors).")
+                   dest="save_pair_level_metadata")
     p.add_argument("--save_pair_level_features", action="store_true",
                    dest="save_pair_level_metadata",
-                   help=argparse.SUPPRESS)  # deprecated alias for --save_pair_level_metadata
+                   help=argparse.SUPPRESS)
+
+    # ---- New flags for phased execution ----
+    p.add_argument("--extract_only", action="store_true",
+                   help="Stop after extraction cache is built. Do not run probes.")
+    p.add_argument("--probe_only", action="store_true",
+                   help="Skip extraction; load from existing cache. No model loading.")
+    p.add_argument("--force_reextract", action="store_true",
+                   help="Ignore prior cache and rebuild extraction from scratch.")
+    p.add_argument("--extraction_chunk_size", type=int, default=25,
+                   help="Number of pairs per extraction chunk (default 25).")
+    p.add_argument("--cache_dir", default=None,
+                   help="Extraction cache directory. Default: <output_dir>/extraction_cache.")
+
     return p.parse_args()
 
 
@@ -1443,31 +1708,34 @@ def main():
     args = parse_args()
     rng  = np.random.default_rng(args.seed)
 
-    # Req 18: bootstrap check
     if args.n_bootstrap > 0:
         raise NotImplementedError(
-            f"--n_bootstrap {args.n_bootstrap} was requested, but bootstrap CI is not yet implemented. "
-            "Set --n_bootstrap 0 (default) to skip bootstrap inference.")
+            f"--n_bootstrap {args.n_bootstrap} requested, but bootstrap CI not yet implemented.")
+
+    if args.extract_only and args.probe_only:
+        print("ERROR: --extract_only and --probe_only are mutually exclusive.")
+        raise SystemExit(1)
+
+    if not args.probe_only and not args.model_path:
+        print("ERROR: --model_path is required unless --probe_only is set.")
+        raise SystemExit(1)
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir = Path(args.cache_dir) if args.cache_dir else output_dir / "extraction_cache"
     plots_dir = output_dir / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
 
     global_warnings: list[str] = []
-
-    # Req 8: resolve probe_class_weight
     probe_class_weight = None if args.probe_class_weight == "none" else args.probe_class_weight
 
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------
     # 1. Load and sample data
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------
     print("Loading pairs...")
-    # Req 15: load focal pairs and control pairs separately
     all_pairs_focal, assignment_log_focal = load_pairs(args.data_path, include_controls=False)
     print(f"  Total focal pairs loaded: {len(all_pairs_focal)}")
 
-    # Load control pairs if requested
     control_pairs_all: list = []
     if args.include_controls:
         all_pairs_with_ctrl, _ = load_pairs(args.data_path, include_controls=True)
@@ -1493,7 +1761,6 @@ def main():
         family_sample_counts[fam] = len(fam_all)
         sampled_pairs.extend(fam_all)
 
-    # Req 15: sample control pairs separately
     sampled_control_pairs: list = []
     if control_pairs_all:
         if len(control_pairs_all) > args.max_pairs:
@@ -1508,82 +1775,114 @@ def main():
         print("ERROR: no pairs after sampling. Check --data_path and --families.")
         return
 
-    # -----------------------------------------------------------------------
-    # 2. Load model
-    # -----------------------------------------------------------------------
-    model, tok, device = load_model_and_tok(args.model_path, args.device, args.dtype)
-    # n_hidden_states = n_transformer_layers + 1 (embedding is index 0)
-    n_hidden_states      = model.config.num_hidden_layers + 1
-    n_transformer_layers = model.config.num_hidden_layers
-    hidden_size          = model.config.hidden_size
-    print(f"  n_hidden_states (incl. embedding): {n_hidden_states}")
-
-    # -----------------------------------------------------------------------
-    # 3. Extract features
-    # -----------------------------------------------------------------------
-    # Req 15: combine focal + control for extraction
     all_extraction_pairs = sampled_pairs + sampled_control_pairs
 
-    print(f"\nExtracting features (scopes={args.feature_scope})...")
-    feature_bank = extract_features(
-        model, tok, all_extraction_pairs, device,
-        scopes=args.feature_scope,
-        window_radius=args.window_radius,
-        min_prefix_tokens=args.min_prefix_tokens,
-        min_suffix_tokens=args.min_suffix_tokens,
-    )
-    print(f"  Feature bank: {len(feature_bank)} pairs extracted.")
+    # -------------------------------------------------------------------
+    # 2. Phase A: Extraction
+    # -------------------------------------------------------------------
+    if not args.probe_only:
+        print(f"\n{'='*60}")
+        print(f"PHASE A: EXTRACTION")
+        print(f"  scopes={args.feature_scope}, chunk_size={args.extraction_chunk_size}")
+        print("=" * 60)
 
-    n_fallback = sum(1 for r in feature_bank if r["edit_fallback"])
+        model, tok, device = load_model_and_tok(args.model_path, args.device, args.dtype)
+        n_hidden_states      = model.config.num_hidden_layers + 1
+        n_transformer_layers = model.config.num_hidden_layers
+        hidden_size          = model.config.hidden_size
+        print(f"  n_hidden_states (incl. embedding): {n_hidden_states}")
+
+        run_extraction_phase(
+            model, tok, all_extraction_pairs, device,
+            cache_dir=cache_dir, scopes=args.feature_scope,
+            chunk_size=args.extraction_chunk_size,
+            window_radius=args.window_radius,
+            min_prefix_tokens=args.min_prefix_tokens,
+            min_suffix_tokens=args.min_suffix_tokens,
+            force_reextract=args.force_reextract,
+        )
+
+        # Free model memory
+        del model, tok
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+        print("  Model unloaded, GPU memory freed.")
+
+    if args.extract_only:
+        print(f"\nExtraction complete. Cache directory: {cache_dir}")
+        print("Run with --probe_only to fit probes without reloading the model.")
+        return
+
+    # -------------------------------------------------------------------
+    # 3. Phase B: Probing
+    # -------------------------------------------------------------------
+    print(f"\n{'='*60}")
+    print(f"PHASE B: PROBING FROM CACHE")
+    print(f"  cache_dir={cache_dir}")
+    print("=" * 60)
+
+    manifest_path = cache_dir / "cache_manifest.json"
+    if not manifest_path.exists():
+        print(f"ERROR: no cache at {manifest_path}. Run extraction first.")
+        return
+
+    with open(manifest_path) as f:
+        manifest = json.load(f)
+
+    pair_metas_all = _load_pair_index(cache_dir)
+    pair_metas = [m for m in pair_metas_all if m.get("status") == "extracted"]
+    print(f"  Loaded {len(pair_metas)} extracted pairs from cache")
+
+    n_hidden_states      = manifest["n_layers"]
+    n_transformer_layers = n_hidden_states - 1
+    hidden_size          = manifest["hidden_size"]
+
+    n_fallback = sum(1 for m in pair_metas if m.get("edit_fallback") in (1, "1", True))
     if n_fallback > 0:
-        w = (f"{n_fallback}/{len(feature_bank)} pairs had no detectable token-level edit span "
-             f"under prefix/suffix alignment (orig and cf tokenize to an identical sequence, "
-             f"or the differing region could not be localized); span-derived scopes "
-             f"(edited_span_mean, edited_window_mean, prefix_mean, suffix_mean) "
-             f"are unavailable (stored as None) for those pairs.")
+        w = (f"{n_fallback}/{len(pair_metas)} pairs had no detectable token-level edit span; "
+             f"span-derived scopes are unavailable for those pairs.")
         print(f"  Warning: {w}")
         global_warnings.append(w)
 
-    # Count pairs where at least one layer has omitted features per span scope
     n_pairs_with_omitted_features_by_scope: dict[str, int] = {}
     for sc in args.feature_scope:
         if sc in _SPAN_SCOPES:
-            omitted = sum(
-                1 for r in feature_bank
-                if any(r["orig_feats"].get(sc, {}).get(l) is None
-                       for l in r["orig_feats"].get(sc, {}))
-            )
-            n_pairs_with_omitted_features_by_scope[sc] = omitted
+            n_pairs_with_omitted_features_by_scope[sc] = n_fallback
 
     if args.save_pair_level_metadata:
-        pair_meta_rows = [
-            {k: v for k, v in r.items() if not k.endswith("_feats")}
-            for r in feature_bank
-        ]
-        save_csv(pair_meta_rows, output_dir / "pair_level_metadata.csv")
-        print(f"  Saved pair-level metadata to pair_level_metadata.csv")
+        save_csv(pair_metas, output_dir / "pair_level_metadata.csv")
+        print("  Saved pair_level_metadata.csv")
 
-    # Free model memory — not needed after extraction
-    del model
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------
     # 4. Run probes per scope
-    # -----------------------------------------------------------------------
-    # Req 1: all_results_by_scope keyed by scope name (outer scope)
+    # -------------------------------------------------------------------
     all_results_by_scope: dict[str, dict] = {}
-
-    # Track task sample sizes and invalid layer counts
     task_sample_sizes: dict[str, dict] = {}
     invalid_layer_counts: dict[str, dict] = {}
 
     for scope in args.feature_scope:
+        if scope not in manifest["scopes"]:
+            w = f"Scope '{scope}' not in cache (cached: {manifest['scopes']}). Skipping."
+            print(f"  Warning: {w}")
+            global_warnings.append(w)
+            continue
+
         print(f"\n{'='*60}")
-        print(f"PROBES  |  scope: {scope}")
+        print(f"Loading cached features — scope: {scope}")
         print("=" * 60)
 
-        # Req 1: fresh scope_results dict for each scope
+        orig_scope, cf_scope, valid_scope = load_scope_from_cache(
+            cache_dir, scope, manifest)
+
+        if orig_scope.shape[0] != len(pair_metas):
+            print(f"  ERROR: shape mismatch: {orig_scope.shape[0]} cached rows vs "
+                  f"{len(pair_metas)} pair_index entries. Cache may be corrupt.")
+            continue
+
+        print(f"  Loaded: {orig_scope.shape} per side, "
+              f"~{(orig_scope.nbytes + cf_scope.nbytes) / 1e9:.2f} GB")
+
         scope_results: dict = {}
         task_sample_sizes[scope] = {}
         invalid_layer_counts[scope] = {}
@@ -1593,19 +1892,20 @@ def main():
             print("\n  [A] orig_vs_cf  (Manipulation Detectability)")
             orig_vs_cf_by_family = {}
             for fam in requested_families:
-                fam_bank = [r for r in feature_bank if r["family"] == fam]
-                if not fam_bank:
+                n_fam = sum(1 for m in pair_metas if m["family"] == fam)
+                if n_fam == 0:
                     continue
-                print(f"    {fam}  n={len(fam_bank)}...", end=" ", flush=True)
-                rows = run_layerwise_probe(
-                    bank=fam_bank, task="orig_vs_cf", scope=scope,
+                print(f"    {fam}  n={n_fam}...", end=" ", flush=True)
+                rows = run_layerwise_probe_cached(
+                    pair_metas=pair_metas,
+                    orig_scope=orig_scope, cf_scope=cf_scope, valid_scope=valid_scope,
+                    task="orig_vs_cf", scope=scope,
                     family=fam, families_global=requested_families,
                     n_hidden_states=n_hidden_states,
                     test_size=args.test_size, seed=args.seed,
                     min_examples_per_class=args.min_examples_per_class,
                     balance_classes=args.balance_classes,
-                    probe_C=args.probe_C,
-                    probe_max_iter=args.probe_max_iter,
+                    probe_C=args.probe_C, probe_max_iter=args.probe_max_iter,
                     probe_class_weight=probe_class_weight,
                 )
                 orig_vs_cf_by_family[fam] = rows
@@ -1623,15 +1923,14 @@ def main():
                     "task_display_name":  "orig_vs_cf_manipulation_detectability",
                     "family":             fam,
                     "feature_scope":      scope,
-                    "n_pairs":            len(fam_bank),
-                    "n_bank_pairs":       len(fam_bank),
-                    "bank_filter":        f"family == '{fam}'",
+                    "n_pairs":            n_fam,
                     "n_hidden_states":    n_hidden_states,
                     "hidden_size":        hidden_size,
                     "class_labels":       ["orig", "cf"],
                     "grouped_split":      True,
                     "test_size":          args.test_size,
                     "seed":               args.seed,
+                    "truncation_max_length": TRUNCATION_MAX_LENGTH,
                     "stage3_expected_peak_description": STAGE3_EDIT_MASS_PEAK.get(fam),
                     "controls_excluded": True,
                     "controls_excluded_reason": (
@@ -1650,24 +1949,25 @@ def main():
                 else:
                     print("no valid layers")
 
-            plot_orig_vs_cf_curves(
-                orig_vs_cf_by_family, scope=scope,
-                output_path=plots_dir / f"01_orig_vs_cf_{scope}.png",
-            )
+            if orig_vs_cf_by_family:
+                plot_orig_vs_cf_curves(
+                    orig_vs_cf_by_family, scope=scope,
+                    output_path=plots_dir / f"01_orig_vs_cf_{scope}.png",
+                )
 
         # ---- Task B: family identity ----
         if "family_identity" in args.probe_tasks:
             print("\n  [B] family_identity")
-            focal_bank = [r for r in feature_bank if r["family"] in set(requested_families)]
-            rows = run_layerwise_probe(
-                bank=focal_bank, task="family_identity", scope=scope,
+            rows = run_layerwise_probe_cached(
+                pair_metas=pair_metas,
+                orig_scope=orig_scope, cf_scope=cf_scope, valid_scope=valid_scope,
+                task="family_identity", scope=scope,
                 family=None, families_global=requested_families,
                 n_hidden_states=n_hidden_states,
                 test_size=args.test_size, seed=args.seed,
                 min_examples_per_class=args.min_examples_per_class,
                 balance_classes=args.balance_classes,
-                probe_C=args.probe_C,
-                probe_max_iter=args.probe_max_iter,
+                probe_C=args.probe_C, probe_max_iter=args.probe_max_iter,
                 probe_class_weight=probe_class_weight,
             )
             scope_results[("global", "family_identity")] = rows
@@ -1686,19 +1986,17 @@ def main():
                 "families":         requested_families,
                 "n_classes":        len(requested_families),
                 "source":           "CF hidden states only",
-                "n_bank_pairs":     len(focal_bank),
-                "bank_filter":      "family in requested_families (controls excluded)",
                 "grouped_split":    True,
+                "truncation_max_length": TRUNCATION_MAX_LENGTH,
                 "controls_excluded": True,
                 "controls_excluded_reason": (
                     "family_identity uses only the focal families in --families; "
-                    "control pairs are not a valid demographic family class for this task."
+                    "control pairs are not a valid demographic family class."
                 ),
                 "contrast_with_orig_vs_cf": (
                     "Unlike orig_vs_cf (manipulation detectability), family_identity asks "
-                    "whether different demographic families occupy separable regions in the "
-                    "model's CF representation space. High accuracy here reflects "
-                    "representational separability, not edit detectability."
+                    "whether different *types* of demographic edits are separable in the "
+                    "model's CF representation space."
                 ),
                 "note": (
                     "High accuracy here means different demographic families occupy "
@@ -1720,38 +2018,38 @@ def main():
             print("\n  [C] within_family_attribute")
             within_by_family = {}
             for fam in requested_families:
-                fam_bank = [r for r in feature_bank if r["family"] == fam]
-                if not fam_bank:
+                n_fam = sum(1 for m in pair_metas if m["family"] == fam)
+                if n_fam == 0:
                     continue
                 excl = set(args.within_family_exclude_labels or [])
-                counts = Counter(
-                    r["attr_val"] for r in fam_bank if r["attr_val"] not in excl)
+                fam_metas = [m for m in pair_metas
+                             if m["family"] == fam and m["attr_val"] not in excl]
+                counts = Counter(m["attr_val"] for m in fam_metas)
                 valid_cls = [cls for cls, cnt in counts.items()
                              if cnt >= args.min_examples_per_class]
                 if len(valid_cls) < 2:
                     print(f"    {fam}: skip  ({len(valid_cls)} valid class(es) with "
                           f">={args.min_examples_per_class} examples)")
                     continue
-                # SO within-family is opt-in due to label heterogeneity (req 11)
                 if fam == "sexual_orientation" and not args.so_within_family:
                     w = (
-                        "within_family_attribute for sexual_orientation skipped by default "
-                        "(labels mix orientation-identity and relationship-context variants). "
+                        "within_family_attribute for sexual_orientation skipped by default. "
                         "Use --so_within_family to enable."
                     )
                     print(f"    {fam}: skipped  (use --so_within_family to enable)")
                     global_warnings.append(w)
                     continue
                 print(f"    {fam}  ({len(valid_cls)} classes)...", end=" ", flush=True)
-                rows = run_layerwise_probe(
-                    bank=fam_bank, task="within_family_attribute", scope=scope,
+                rows = run_layerwise_probe_cached(
+                    pair_metas=pair_metas,
+                    orig_scope=orig_scope, cf_scope=cf_scope, valid_scope=valid_scope,
+                    task="within_family_attribute", scope=scope,
                     family=fam, families_global=requested_families,
                     n_hidden_states=n_hidden_states,
                     test_size=args.test_size, seed=args.seed,
                     min_examples_per_class=args.min_examples_per_class,
                     balance_classes=args.balance_classes,
-                    probe_C=args.probe_C,
-                    probe_max_iter=args.probe_max_iter,
+                    probe_C=args.probe_C, probe_max_iter=args.probe_max_iter,
                     probe_class_weight=probe_class_weight,
                     within_family_exclude_labels=args.within_family_exclude_labels,
                 )
@@ -1764,7 +2062,6 @@ def main():
                     task_sample_sizes[scope][key] = s_samp
                 invalid_layer_counts[scope][key] = sum(1 for r in rows if r.get("error"))
 
-                # Req 11: save all class counts; add caution note for sexual_orientation
                 exp_meta = {
                     "task":                   "within_family_attribute",
                     "family":                 fam,
@@ -1774,30 +2071,24 @@ def main():
                     "dropped_classes":        [cls for cls in counts if cls not in valid_cls],
                     "excluded_labels":        list(excl),
                     "min_examples_per_class": args.min_examples_per_class,
-                    "n_bank_pairs":           len(fam_bank),
-                    "bank_filter":            f"family == '{fam}'",
+                    "truncation_max_length":  TRUNCATION_MAX_LENGTH,
                     "controls_excluded":      True,
                     "controls_excluded_reason": (
-                        "within_family_attribute is a per-focal-family task; "
-                        "control pairs are not included."
+                        "within_family_attribute is a per-focal-family task."
                     ),
                     "caution_attribute_encoding": (
                         "Performance may partly reflect lexical regularities of the edit "
-                        "templates (e.g. shared morphology, word length, or topic within "
-                        "an attribute class) rather than abstract demographic encoding. "
-                        "Interpret as 'attribute-conditioned edit decodability', not as "
-                        "pure representation of demographic attributes per se."
+                        "templates rather than abstract demographic encoding."
                     ),
                 }
                 if fam == "sexual_orientation":
                     exp_meta["caution_label_heterogeneity"] = (
                         "Labels for sexual_orientation may mix orientation-identity labels "
-                        "(gay, straight) with relationship-context labels (partner). "
-                        "Interpret within-family attribute task cautiously for this family."
+                        "(gay, straight) with relationship-context labels (partner)."
                     )
-                save_experiment(exp_dir=output_dir / fam / f"within_family_attribute_{scope}",
-                                metadata=exp_meta,
-                                per_layer_rows=rows)
+                save_experiment(
+                    exp_dir=output_dir / fam / f"within_family_attribute_{scope}",
+                    metadata=exp_meta, per_layer_rows=rows)
 
                 s = summarize_layers(rows)
                 if s:
@@ -1813,23 +2104,25 @@ def main():
 
         # ---- Task D: context_split (SO only) ----
         if "context_split" in args.probe_tasks and "sexual_orientation" in requested_families:
-            so_bank = [r for r in feature_bank if r["family"] == "sexual_orientation"]
-            n_partner  = sum(1 for r in so_bank if r.get("split_label") == "partner")
-            n_explicit = sum(1 for r in so_bank if r.get("split_label") == "explicit")
-            n_other    = sum(1 for r in so_bank if r.get("split_label") == "other")
+            so_metas = [m for m in pair_metas if m["family"] == "sexual_orientation"]
+            n_partner  = sum(1 for m in so_metas if m.get("split_label") == "partner")
+            n_explicit = sum(1 for m in so_metas if m.get("split_label") == "explicit")
+            n_other    = sum(1 for m in so_metas if m.get("split_label") == "other")
             print(f"\n  [D] context_split  "
                   f"partner={n_partner}  explicit={n_explicit}  other_dropped={n_other}")
 
-            if n_partner >= args.min_examples_per_class and n_explicit >= args.min_examples_per_class:
-                rows = run_layerwise_probe(
-                    bank=so_bank, task="context_split", scope=scope,
+            if (n_partner >= args.min_examples_per_class and
+                    n_explicit >= args.min_examples_per_class):
+                rows = run_layerwise_probe_cached(
+                    pair_metas=pair_metas,
+                    orig_scope=orig_scope, cf_scope=cf_scope, valid_scope=valid_scope,
+                    task="context_split", scope=scope,
                     family="sexual_orientation", families_global=requested_families,
                     n_hidden_states=n_hidden_states,
                     test_size=args.test_size, seed=args.seed,
                     min_examples_per_class=args.min_examples_per_class,
                     balance_classes=args.balance_classes,
-                    probe_C=args.probe_C,
-                    probe_max_iter=args.probe_max_iter,
+                    probe_C=args.probe_C, probe_max_iter=args.probe_max_iter,
                     probe_class_weight=probe_class_weight,
                 )
                 scope_results[("sexual_orientation", "context_split")] = rows
@@ -1846,23 +2139,16 @@ def main():
                     "family":           "sexual_orientation",
                     "feature_scope":    scope,
                     "class_labels":     ["partner", "explicit"],
-                    "n_bank_pairs":     len(so_bank),
-                    "bank_filter":      "family == 'sexual_orientation'",
                     "n_partner":        n_partner,
                     "n_explicit":       n_explicit,
                     "n_other_dropped":  n_other,
-                    # Req 12: updated task description
+                    "truncation_max_length": TRUNCATION_MAX_LENGTH,
                     "task_description": (
-                        "Classifies partner-neutralized SO edits (e.g. 'partner') vs "
-                        "explicit-orientation edits (e.g. 'gay', 'straight'). High decodability "
-                        "means these variant types are representationally separable, not that "
-                        "orientation identity itself is decodable."
+                        "Classifies partner-neutralized SO edits vs explicit-orientation edits."
                     ),
                     "note_stage4_b3": (
                         "Stage 4 B3 showed strong behavioral differences between "
-                        "partner-framed and explicit-identity SO pairs. If decodability "
-                        "is high here too, the split is encoded in representations, "
-                        "not only in behavior."
+                        "partner-framed and explicit-identity SO pairs."
                     ),
                 }, per_layer_rows=rows)
 
@@ -1882,29 +2168,29 @@ def main():
 
         # ---- Task E: focal_vs_control_cf ----
         if "focal_vs_control_cf" in args.probe_tasks:
-            ctrl_in_bank = [r for r in feature_bank if r["family"] == "control"]
-            if not ctrl_in_bank:
-                w = "focal_vs_control_cf skipped: no control pairs in feature bank. Use --include_controls."
+            ctrl_count = sum(1 for m in pair_metas if m["family"] == "control")
+            if ctrl_count == 0:
+                w = ("focal_vs_control_cf skipped: no control pairs in cache. "
+                     "Use --include_controls.")
                 print(f"\n  Warning: {w}")
                 global_warnings.append(w)
             else:
-                print(f"\n  [E] focal_vs_control_cf  n_control={len(ctrl_in_bank)}")
+                print(f"\n  [E] focal_vs_control_cf  n_control={ctrl_count}")
                 for fam in requested_families:
-                    fam_bank = [r for r in feature_bank if r["family"] == fam]
-                    if not fam_bank:
+                    n_fam = sum(1 for m in pair_metas if m["family"] == fam)
+                    if n_fam == 0:
                         continue
-                    print(f"    {fam}  n_focal={len(fam_bank)}...", end=" ", flush=True)
-                    focal_ctrl_bank = [r for r in feature_bank
-                                       if r["family"] in {fam, "control"}]
-                    rows = run_layerwise_probe(
-                        bank=focal_ctrl_bank, task="focal_vs_control_cf", scope=scope,
+                    print(f"    {fam}  n_focal={n_fam}...", end=" ", flush=True)
+                    rows = run_layerwise_probe_cached(
+                        pair_metas=pair_metas,
+                        orig_scope=orig_scope, cf_scope=cf_scope, valid_scope=valid_scope,
+                        task="focal_vs_control_cf", scope=scope,
                         family=fam, families_global=requested_families,
                         n_hidden_states=n_hidden_states,
                         test_size=args.test_size, seed=args.seed,
                         min_examples_per_class=args.min_examples_per_class,
                         balance_classes=args.balance_classes,
-                        probe_C=args.probe_C,
-                        probe_max_iter=args.probe_max_iter,
+                        probe_C=args.probe_C, probe_max_iter=args.probe_max_iter,
                         probe_class_weight=probe_class_weight,
                     )
                     scope_results[(fam, "focal_vs_control_cf")] = rows
@@ -1921,25 +2207,16 @@ def main():
                         "family":        fam,
                         "feature_scope": scope,
                         "class_labels":  ["control", "focal"],
-                        "n_focal":         len(fam_bank),
-                        "n_control":       len(ctrl_in_bank),
-                        "n_bank_pairs":    len(focal_ctrl_bank),
-                        "bank_filter":     f"family in {{'{fam}', 'control'}}",
+                        "n_focal":       n_fam,
+                        "n_control":     ctrl_count,
+                        "truncation_max_length": TRUNCATION_MAX_LENGTH,
                         "controls_usage": (
                             "control pairs serve as label=0 (negative class); "
                             "focal CF pairs serve as label=1 (positive class)."
                         ),
-                        "controls_role": (
-                            "Controls provide a non-demographic CF baseline. "
-                            "High accuracy means focal CFs have distinct hidden-state "
-                            "representations from neutral/irrelevant edits — "
-                            "not merely that an edit was made."
-                        ),
                         "caution_confound": (
                             "High accuracy may reflect demographic-specific representation "
-                            "AND/OR structural differences between focal and control "
-                            "counterfactuals (e.g., edit length, syntactic category, topic). "
-                            "These confounds are not separable from this task alone."
+                            "AND/OR structural differences between focal and control CFs."
                         ),
                     }, per_layer_rows=rows)
 
@@ -1949,36 +2226,33 @@ def main():
                     else:
                         print("no valid layers")
 
-        # Req 10: generate two heatmaps per scope
+        # Heatmaps per scope
         if scope_results:
             plot_summary_heatmap(
                 scope_results, scope=scope,
                 output_path=plots_dir / f"05_summary_heatmap_normalized_{scope}.png",
                 metric="normalized_decoding_gain",
-                cmap="RdBu",
-                vcenter=0.0,
-                vmin=-1.0,
-                vmax=1.0,
+                cmap="RdBu", vcenter=0.0, vmin=-1.0, vmax=1.0,
             )
             plot_summary_heatmap(
                 scope_results, scope=scope,
                 output_path=plots_dir / f"05b_summary_heatmap_raw_{scope}.png",
                 metric="balanced_accuracy",
-                cmap="RdYlGn",
-                vcenter=None,
-                vmin=0.0,
-                vmax=1.0,
+                cmap="RdYlGn", vcenter=None, vmin=0.0, vmax=1.0,
             )
 
-        # Req 1: store this scope's results into the outer dict
         all_results_by_scope[scope] = scope_results
 
-    # -----------------------------------------------------------------------
+        # Free scope arrays before loading next scope
+        del orig_scope, cf_scope, valid_scope
+        gc.collect()
+        print(f"\n  Freed cached arrays for scope: {scope}")
+
+    # -------------------------------------------------------------------
     # 5. Summary JSON
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------
     print("\nBuilding summary.json...")
 
-    # Req 17: rich localization_peaks structure
     localization_peaks: dict[str, dict] = {}
     for scope, scope_results in all_results_by_scope.items():
         localization_peaks[scope] = {}
@@ -2003,8 +2277,10 @@ def main():
                     "stage3_alignment_flag":    alignment_flag,
                 }
 
-    n_extracted_focal   = sum(1 for r in feature_bank if r["family"] != "control")
-    n_extracted_control = sum(1 for r in feature_bank if r["family"] == "control")
+    n_extracted_focal   = sum(1 for m in pair_metas if m["family"] != "control")
+    n_extracted_control = sum(1 for m in pair_metas if m["family"] == "control")
+    n_failed_total = sum(1 for m in pair_metas_all if m.get("status") == "failed")
+
     summary = {
         "script":  SCRIPT_NAME,
         "version": VERSION,
@@ -2013,13 +2289,21 @@ def main():
             "n_loaded_focal_pairs":                   len(all_pairs_focal),
             "n_sampled_focal_pairs":                  len(sampled_pairs),
             "n_sampled_control_pairs":                len(sampled_control_pairs),
-            "n_extracted_total_pairs":                len(feature_bank),
+            "n_extracted_total_pairs":                len(pair_metas),
             "n_extracted_focal_pairs":                n_extracted_focal,
             "n_extracted_control_pairs":              n_extracted_control,
+            "n_failed_pairs":                         n_failed_total,
             "controls_loaded":                        bool(args.include_controls),
             "family_sample_counts":                   family_sample_counts,
             "n_edit_fallbacks":                       n_fallback,
             "n_pairs_with_omitted_features_by_scope": n_pairs_with_omitted_features_by_scope,
+        },
+        "extraction_cache": {
+            "cache_dir":              str(cache_dir),
+            "chunk_size":             args.extraction_chunk_size,
+            "truncation_max_length":  TRUNCATION_MAX_LENGTH,
+            "resumed_from_cache":     manifest.get("resumed_from_cache", False),
+            "n_chunks":               len(manifest.get("chunks", [])),
         },
         "controls": {
             "controls_requested":        bool(args.include_controls),
@@ -2047,7 +2331,6 @@ def main():
                 "regions":   "embedding=0; early=1..3; mid=4..15; late=16+",
             },
         },
-        # Req 8: probe hyperparameters in summary
         "probe_hyperparameters": {
             "C":               args.probe_C,
             "max_iter":        args.probe_max_iter,
@@ -2062,62 +2345,51 @@ def main():
             "decodability_vs_causality": (
                 "Probe accuracy measures whether demographic information is PRESENT and "
                 "linearly readable at a given layer. It does NOT imply that causally "
-                "intervening on that layer (e.g., ablation, patching) would change "
-                "model behavior. The two properties can dissociate."
+                "intervening on that layer would change model behavior."
             ),
             "high_decode_weak_causal_means": (
                 "If Stage 4 ablation recovery was weak but Stage 4.5 decodability is high, "
-                "that suggests distributed or redundant representation: the information is "
-                "there, but removing it from one channel does not remove it from the system."
+                "that suggests distributed or redundant representation."
             ),
             "convergent_localization": (
                 "If Stage 3 edit-mass peaks, Stage 4 residual patching recovery peaks, "
-                "and Stage 4.5 decoding peaks all align at the same layers, that provides "
-                "convergent evidence for localization of the demographic signal."
+                "and Stage 4.5 decoding peaks all align, that provides convergent evidence "
+                "for localization of the demographic signal."
             ),
             "so_hypothesis": (
                 "Sexual orientation may show weaker early decodability and stronger "
-                "mid/late-layer decodability, consistent with Stage 4 B1 showing diffuse "
-                "recovery and Stage 4 B3 showing a strong partner-vs-explicit behavioral split."
+                "mid/late-layer decodability, consistent with Stage 4 findings."
             ),
             "stage3_reference": (
-                "Stage 3 edit-mass heatmaps showed early-layer peaks for gender_identity and race. "
-                "Compare stage45_results localization_peaks to STAGE3_EDIT_MASS_PEAK below."
+                "Stage 3 edit-mass heatmaps showed early-layer peaks for gender_identity "
+                "and race."
             ),
             "orig_vs_cf_framing": (
-                "The orig_vs_cf task (a.k.a. manipulation_detectability) classifies original vs "
-                "counterfactually-edited hidden states. High accuracy means the model encodes "
-                "the edit, not necessarily that it encodes the demographic attribute itself."
+                "The orig_vs_cf task classifies original vs counterfactually-edited hidden "
+                "states. High accuracy means the model encodes the edit, not necessarily "
+                "the demographic attribute itself."
             ),
             "context_split_framing": (
                 "The context_split task classifies partner-neutralized SO edits vs "
-                "explicit-orientation edits. High decodability means these variant types are "
-                "representationally separable, not that orientation identity itself is decodable."
+                "explicit-orientation edits."
             ),
             "within_family_attribute_caveat": (
-                "within_family_attribute accuracy may partly reflect lexical regularities of "
-                "the edit templates (e.g. shared morphology, word length, or topic within an "
-                "attribute class) rather than abstract demographic encoding. Interpret as "
-                "'attribute-conditioned edit decodability', not pure representation of "
-                "demographic attributes. This caveat applies to all families."
+                "within_family_attribute accuracy may partly reflect lexical regularities "
+                "of edit templates rather than abstract demographic encoding."
             ),
             "focal_vs_control_cf_caveat": (
                 "focal_vs_control_cf accuracy may reflect demographic-specific representation "
-                "AND/OR structural differences in how focal vs control counterfactuals were "
-                "constructed (edit length, syntactic category, topic). These confounds are not "
-                "fully separable from this task alone."
+                "AND/OR structural differences in how focal vs control CFs were constructed."
             ),
         },
         "stage3_expected_peaks":  STAGE3_EDIT_MASS_PEAK,
         "stage3_expected_regions": STAGE3_EXPECTED_REGION,
         "stage3_expected_regions_note": (
-            "Values may be a single string or a list of acceptable region strings. "
-            "sex_gender accepts ['early', 'mid'] (Stage 3: early-to-mid peaks). "
-            "sexual_orientation accepts ['mid', 'late'] (Stage 3: diffuse / mid-late)."
+            "Values may be a single string or a list of acceptable region strings."
         ),
     }
     save_json(summary, output_dir / "summary.json")
-    print(f"Done.  Results → {output_dir}")
+    print(f"Done.  Results -> {output_dir}")
 
 
 if __name__ == "__main__":
