@@ -20,9 +20,11 @@ Secondary / corroborating metrics:
     6. destructive_causal_fraction_margin — same for margin
 
 Ablation modes:
-    PRIMARY:   Mean ablation — replaces head activations with their mean over the
-                               original prompts in the focal pair set.  Avoids
-                               out-of-distribution activation values.
+    PRIMARY:   Matched-QID baseline ablation — replaces head activations with a
+                               baseline captured from the ORIGINAL prompt for the
+                               same question (same QID, same layer). Avoids
+                               out-of-distribution activation values and avoids
+                               mixing baselines across unrelated questions.
     SECONDARY: Zero ablation — replaces head activations with zero.  Retained for
                                comparison; negative causal fractions here should be
                                interpreted as OOD collateral damage, not as evidence
@@ -114,6 +116,14 @@ ALL_FOCAL = CASE1_FAMILIES + CASE2_FAMILIES
 # Minimum |Δ gold logit| to include a pair in ratio-based summaries.
 # Passed explicitly through the call stack; never mutated at runtime.
 MIN_EFFECT_THRESHOLD = 0.05
+
+# Probability deltas are on a different scale than logits; treat probability-based
+# recovery/injection as exploratory and gate only on a tiny epsilon for stability.
+PROB_EFFECT_EPS = 1e-6
+
+# Clearing the CUDA cache on every forward pass is usually counterproductive.
+# Gate behind a CLI flag (default: off).
+AGGRESSIVE_CUDA_CACHE_CLEAR = False
 
 FAMILY_COLORS = {
     "gender_identity":    "#9B59B6",
@@ -424,17 +434,20 @@ def ablation_pre_hook(heads_to_ablate: list[int], head_dim: int):
     return hook
 
 
-def mean_ablation_pre_hook(heads_to_ablate: list[int], head_dim: int,
-                            mean_acts: dict, layer_idx: int,
-                            scope: str = "final_token"):
+def qid_baseline_pre_hook(heads_to_ablate: list[int], head_dim: int,
+                          baseline_acts_by_qid: dict, layer_idx: int,
+                          qid: str,
+                          scope: str = "final_token"):
     """
-    MEAN-ablation: replaces head outputs with pre-computed mean over original prompts.
+    Matched-QID baseline ablation: replaces head outputs with a pre-computed baseline
+    from the ORIGINAL prompt for the same question ID (QID).
+
     Primary ablation mode — avoids out-of-distribution activations.
-    Falls back to zero for any layer whose mean was not captured.
+    Falls back to zero for any (qid, layer) whose baseline was not captured.
     """
     def hook(module, args):
         x = args[0].clone()
-        mean_vec = mean_acts.get(layer_idx)
+        mean_vec = (baseline_acts_by_qid.get(qid) or {}).get(layer_idx)
         for h in heads_to_ablate:
             start = h * head_dim
             end = (h + 1) * head_dim
@@ -453,29 +466,57 @@ def mean_ablation_pre_hook(heads_to_ablate: list[int], head_dim: int,
     return hook
 
 
-def save_pre_hook(store: dict, layer_idx: int):
+# Back-compat alias (kept to minimize churn in older call sites).
+mean_ablation_pre_hook = qid_baseline_pre_hook
+
+
+def save_pre_hook(store: dict, layer_idx: int, scope: str = "final_token"):
+    """
+    Forward-pre-hook saver for o_proj inputs.
+    When scope="final_token", stores only the final sequence position to avoid
+    mismatched seq_len between original vs counterfactual prompts.
+    """
     def hook(module, args):
-        store[layer_idx] = args[0].detach().clone()
+        x = args[0].detach()
+        store[layer_idx] = (x[:, -1:, :].clone() if scope == "final_token" else x.clone())
     return hook
 
 
 def patch_pre_hook(source_store: dict, layer_idx: int,
-                   heads_to_patch: list[int], head_dim: int):
+                   heads_to_patch: list[int], head_dim: int,
+                   scope: str = "final_token"):
     def hook(module, args):
         src = source_store.get(layer_idx)
         if src is None:
             return None
         x = args[0].clone()
+        src_t = src.to(device=x.device, dtype=x.dtype)
+        if scope == "final_token":
+            # Patch only the final token to remain well-defined under seq_len mismatch.
+            if src_t.ndim == 3 and src_t.shape[1] != 1:
+                src_tok = src_t[:, -1:, :]
+            else:
+                src_tok = src_t
+            for h in heads_to_patch:
+                start = h * head_dim
+                end = (h + 1) * head_dim
+                x[:, -1:, start:end] = src_tok[:, -1:, start:end]
+            return (x,)
+
+        # all_positions: patch the overlapping prefix only (never change seq_len)
+        min_len = min(x.shape[1], src_t.shape[1])
         for h in heads_to_patch:
-            x[:, :, h * head_dim:(h + 1) * head_dim] = \
-                src[:, :, h * head_dim:(h + 1) * head_dim]
+            start = h * head_dim
+            end = (h + 1) * head_dim
+            x[:, :min_len, start:end] = src_t[:, :min_len, start:end]
         return (x,)
     return hook
 
 
 def save_residual_hook(store: dict, layer_idx: int):
     def hook(module, args, output):
-        store[layer_idx] = output[0].detach().clone()
+        hs = output[0] if isinstance(output, (tuple, list)) else output
+        store[layer_idx] = hs.detach().clone()
     return hook
 
 
@@ -485,9 +526,13 @@ def residual_patch_hook(source_store: dict, layer_idx: int):
         src = source_store.get(layer_idx)
         if src is None:
             return output
-        hs = output[0].clone()
-        hs[:, -1:, :] = src[:, -1:, :]
-        return (hs,) + output[1:]
+        hs = output[0] if isinstance(output, (tuple, list)) else output
+        new_hs = hs.clone()
+        src_t = src.to(device=new_hs.device, dtype=new_hs.dtype)
+        new_hs[:, -1:, :] = src_t[:, -1:, :]
+        if isinstance(output, (tuple, list)):
+            return (new_hs,) + tuple(output[1:])
+        return new_hs
     return hook
 
 
@@ -522,7 +567,9 @@ def patch_attn_out_hook(source_store: dict, layer_idx: int,
         if intervention_scope == "final_token":
             new_hs[:, -1:, :] = src_t[:, -1:, :]
         else:
-            new_hs = src_t
+            # Patch overlapping prefix only; keep target seq_len intact.
+            min_len = min(new_hs.shape[1], src_t.shape[1])
+            new_hs[:, :min_len, :] = src_t[:, :min_len, :]
         return (new_hs,) + output[1:]
     return hook
 
@@ -554,7 +601,11 @@ def patch_mlp_out_hook(source_store: dict, layer_idx: int,
             out = output.clone()
             out[:, -1:, :] = src_t[:, -1:, :]
             return out
-        return src_t
+        # Patch overlapping prefix only; keep target seq_len intact.
+        out = output.clone()
+        min_len = min(out.shape[1], src_t.shape[1])
+        out[:, :min_len, :] = src_t[:, :min_len, :]
+        return out
     return hook
 
 
@@ -612,6 +663,85 @@ def compute_mean_head_activations(model, tok, pairs: list, layers_of_interest: l
     return result
 
 
+def compute_qid_matched_head_activations(
+    model, tok, pairs: list, layers_of_interest: list,
+    device: str,
+    scope: str = "final_token",
+) -> dict:
+    """
+    Compute matched-QID baselines for mean ablation.
+
+    Returns:
+        {qid: {layer_idx: tensor of shape (n_heads * head_dim,)}}
+
+    Implementation:
+      - One forward pass per unique QID using that QID's ORIGINAL prompt.
+      - Captures o_proj pre-activations (args[0]) at either the final token or
+        mean across positions depending on `scope`.
+    """
+    if not layers_of_interest:
+        return {}
+
+    # Map qid -> representative original prompt (keep first; prompts should match within QID)
+    qid_to_prompt: dict = {}
+    prompt_mismatch = 0
+    for p in pairs:
+        qid = p.get("qid")
+        if qid is None:
+            continue
+        op = p.get("orig_prompt")
+        if qid not in qid_to_prompt:
+            qid_to_prompt[qid] = op
+        else:
+            if op is not None and qid_to_prompt[qid] is not None and op != qid_to_prompt[qid]:
+                prompt_mismatch += 1
+
+    layers = sorted(set(layers_of_interest))
+    captures: dict = {}
+    current_qid = None
+    n_fail = 0
+
+    def make_hook(l):
+        def hook(module, args):
+            if current_qid is None:
+                return None
+            x = args[0].detach().float()
+            if scope == "final_token":
+                vec = x[0, -1, :].cpu()
+            else:
+                vec = x.mean(dim=(0, 1)).cpu()
+            captures.setdefault(current_qid, {})[l] = vec
+            return None
+        return hook
+
+    handles = [
+        model.model.layers[l].self_attn.o_proj.register_forward_pre_hook(make_hook(l))
+        for l in layers
+    ]
+    with torch.no_grad():
+        for i, (qid, prompt) in enumerate(qid_to_prompt.items()):
+            current_qid = qid
+            try:
+                inp = {k: v.to(device) for k, v in
+                       tok(prompt, return_tensors="pt",
+                           truncation=True, max_length=2048).items()}
+                model(**inp, output_hidden_states=False, use_cache=False)
+            except Exception:
+                n_fail += 1
+            if (i + 1) % 25 == 0:
+                print(f"    QID means: {i+1}/{len(qid_to_prompt)}", end="\r", flush=True)
+    current_qid = None
+    for h in handles:
+        h.remove()
+    if qid_to_prompt:
+        print()
+    if prompt_mismatch:
+        print(f"    Warning: {prompt_mismatch} QID prompt mismatches detected; using first prompt per QID.")
+    if n_fail:
+        print(f"    Warning: QID baseline failures: {n_fail}/{len(qid_to_prompt)}")
+    return captures
+
+
 # ---------------------------------------------------------------------------
 # Core inference
 # ---------------------------------------------------------------------------
@@ -636,7 +766,7 @@ def forward_pass(model, inputs: dict, answer_ids: dict,
     finally:
         for h in handles:
             h.remove()
-        if model.device.type == "cuda":
+        if AGGRESSIVE_CUDA_CACHE_CLEAR and model.device.type == "cuda":
             torch.cuda.empty_cache()
     logits = out.logits[0, -1, :].float()
     return {k: float(logits[tid].cpu()) for k, tid in answer_ids.items()}
@@ -836,11 +966,13 @@ def aggregate_patching_v2(per_pair: list[dict], direction: str) -> dict:
                    "shift_toward_cf_margin"]
 
     strata = {
-        "all":          per_pair,
-        "orig_correct": [r for r in per_pair if r.get("orig_correct")],
-        "significant":  [r for r in per_pair if r.get("is_significant")],
-        "correct_sig":  [r for r in per_pair if r.get("orig_correct")
-                          and r.get("is_significant")],
+        "all":               per_pair,
+        "orig_correct":      [r for r in per_pair if r.get("orig_correct")],
+        "significant":       [r for r in per_pair if r.get("is_significant")],
+        "correct_sig":       [r for r in per_pair if r.get("orig_correct")
+                               and r.get("is_significant")],
+        "answer_flip_pairs": [r for r in per_pair
+                               if r.get("pred_orig") != r.get("pred_cf")],
     }
     out = {}
     for sname, rows in strata.items():
@@ -991,7 +1123,8 @@ def run_ablation_pair(model, tok, pair: dict, answer_ids: dict,
     if mean_activations:
         mean_hooks = [
             (model.model.layers[l].self_attn.o_proj,
-             mean_ablation_pre_hook(hs, head_dim, mean_activations, l, scope=scope), True)
+             mean_ablation_pre_hook(hs, head_dim, mean_activations, l,
+                                    qid=str(pair["qid"]), scope=scope), True)
             for l, hs in heads_by_layer.items()
         ]
     else:
@@ -1026,8 +1159,8 @@ def run_ablation_pair(model, tok, pair: dict, answer_ids: dict,
     rec_logit  = recovery_score(signed_delta_logit,  abl_delta_logit,  min_effect)
     rec_margin = recovery_score(signed_delta_margin, abl_delta_margin,
                                 min_effect) if abs(signed_delta_margin) >= min_effect else None
-    rec_prob   = recovery_score(signed_delta_prob,   abl_delta_prob,
-                                min_effect) if abs(signed_delta_prob) >= min_effect else None
+    # Exploratory: prob recovery is not gated by the logit-scale min_effect.
+    rec_prob   = recovery_score(signed_delta_prob,   abl_delta_prob, PROB_EFFECT_EPS)
 
     abl_flip = bm_orig["pred"] != bm_abl["pred"]
     flip_reduction = int(answer_flip) - int(abl_flip)
@@ -1130,7 +1263,8 @@ def run_ablation_pair(model, tok, pair: dict, answer_ids: dict,
 def run_patching_pair(model, tok, pair: dict, answer_ids: dict,
                        heads_by_layer: dict[int, list[int]],
                        head_dim: int, device: str, direction: str,
-                       min_effect: float = MIN_EFFECT_THRESHOLD) -> dict:
+                       min_effect: float = MIN_EFFECT_THRESHOLD,
+                       scope: str = "final_token") -> dict:
     """
     direction "cf2orig": run CF prompt with original's head activations.
         Primary metric: recovery_to_orig_logit
@@ -1153,7 +1287,7 @@ def run_patching_pair(model, tok, pair: dict, answer_ids: dict,
     # Save activations from source run
     source_store: dict = {}
     save_hooks = [
-        (model.model.layers[l].self_attn.o_proj, save_pre_hook(source_store, l), True)
+        (model.model.layers[l].self_attn.o_proj, save_pre_hook(source_store, l, scope=scope), True)
         for l in heads_by_layer
     ]
     if direction == "cf2orig":
@@ -1165,7 +1299,7 @@ def run_patching_pair(model, tok, pair: dict, answer_ids: dict,
 
     patch_hooks = [
         (model.model.layers[l].self_attn.o_proj,
-         patch_pre_hook(source_store, l, hs, head_dim), True)
+         patch_pre_hook(source_store, l, hs, head_dim, scope=scope), True)
         for l, hs in heads_by_layer.items()
     ]
     bm_pat = behavioral_metrics(
@@ -1185,8 +1319,8 @@ def run_patching_pair(model, tok, pair: dict, answer_ids: dict,
     rec_logit  = recovery_score(delta_base_logit,  pat_delta_logit,  min_effect)
     rec_margin = recovery_score(delta_base_margin, pat_delta_margin, min_effect) \
                  if abs(delta_base_margin) >= min_effect else None
-    rec_prob   = recovery_score(delta_base_prob,   pat_delta_prob,   min_effect) \
-                 if abs(delta_base_prob) >= min_effect else None
+    # Exploratory: prob recovery is not gated by the logit-scale min_effect.
+    rec_prob   = recovery_score(delta_base_prob,   pat_delta_prob,   PROB_EFFECT_EPS)
 
     # Pair-level recovery diagnostics
     overshoot_logit = rec_logit  is not None and rec_logit  > 1.0
@@ -1201,12 +1335,16 @@ def run_patching_pair(model, tok, pair: dict, answer_ids: dict,
     inj_margin = (pat_delta_margin / (delta_base_margin + 1e-8)
                   if abs(delta_base_margin) >= min_effect else None)
     inj_prob  = (pat_delta_prob   / (delta_base_prob   + 1e-8)
-                 if abs(delta_base_prob) >= min_effect else None)
+                 if abs(delta_base_prob) >= PROB_EFFECT_EPS else None)
 
     return {
         "qid":           pair["qid"],
+        "gold":          pair["gold"],
         "direction":     direction,
         "orig_correct":  bool(bm_orig["correct"]),
+        "cf_correct":    bool(bm_cf["correct"]),
+        "answer_flip":   bool(bm_orig["pred"] != bm_cf["pred"]),
+        "correctness_flip": bool(bm_orig["correct"] != bm_cf["correct"]),
         "is_significant": bool(is_significant),
         # Baseline
         "orig_gold_logit": float(bm_orig["gold_logit"]),
@@ -1505,19 +1643,22 @@ def exp_layer_group_ablation(model, tok, pairs, answer_ids,
 
 def exp_direction_patching(model, tok, pairs, answer_ids, heads_by_layer,
                             head_dim, device,
-                            min_effect: float = MIN_EFFECT_THRESHOLD) -> dict:
+                            min_effect: float = MIN_EFFECT_THRESHOLD,
+                            scope: str = "final_token") -> dict:
     cf2orig, orig2cf = [], []
     for i, pair in enumerate(pairs):
         try:
             cf2orig.append(run_patching_pair(model, tok, pair, answer_ids,
                                              heads_by_layer, head_dim, device,
-                                             "cf2orig", min_effect=min_effect))
+                                             "cf2orig", min_effect=min_effect,
+                                             scope=scope))
         except Exception as e:
             print(f"      cf2orig pair {i}: {e}")
         try:
             orig2cf.append(run_patching_pair(model, tok, pair, answer_ids,
                                              heads_by_layer, head_dim, device,
-                                             "orig2cf", min_effect=min_effect))
+                                             "orig2cf", min_effect=min_effect,
+                                             scope=scope))
         except Exception as e:
             print(f"      orig2cf pair {i}: {e}")
         if (i + 1) % 25 == 0:
@@ -1527,14 +1668,28 @@ def exp_direction_patching(model, tok, pairs, answer_ids, heads_by_layer,
     agg_c2o = aggregate_patching_v2(cf2orig, "cf2orig")
     agg_o2c = aggregate_patching_v2(orig2cf, "orig2cf")
 
+    # Baseline diagnostics — print before interpreting recovery/injection numbers
+    n_total  = len(cf2orig)
+    n_sig    = sum(1 for r in cf2orig if r.get("is_significant"))
+    n_flip   = sum(1 for r in cf2orig if r.get("pred_orig") != r.get("pred_cf"))
+    n_corr_flip = sum(1 for r in cf2orig if r.get("correctness_flip"))
+    frac_already_match = (sum(1 for r in cf2orig if r.get("pred_orig") == r.get("pred_cf"))
+                          / n_total if n_total else 0.0)
+    print(f"    BASELINE n={n_total}  n_sig={n_sig}  "
+          f"answer_flip_rate={n_flip/n_total:.3f}  "
+          f"correctness_flip_rate={n_corr_flip/n_total:.3f}  "
+          f"frac_pred_already_match={frac_already_match:.3f}")
+
     sig_c2o = agg_c2o.get("significant", {})
     sig_o2c = agg_o2c.get("significant", {})
-    print(f"    cf2orig recovery(sig):  "
-          f"{_fmt((sig_c2o.get('recovery_to_orig_logit') or {}).get('mean'))}  "
-          f"pred_matches_orig: {_fmt(sig_c2o.get('pred_patched_matches_orig_rate'))}")
-    print(f"    orig2cf injection(sig): "
-          f"{_fmt((sig_o2c.get('injection_to_cf_logit') or {}).get('mean'))}  "
-          f"pred_matches_cf: {_fmt(sig_o2c.get('pred_patched_matches_cf_rate'))}")
+    afp_c2o = agg_c2o.get("answer_flip_pairs", {})
+    afp_o2c = agg_o2c.get("answer_flip_pairs", {})
+    print(f"    cf2orig  recovery(sig)={_fmt((sig_c2o.get('recovery_to_orig_logit') or {}).get('mean'))}  "
+          f"recovery(flip_pairs)={_fmt((afp_c2o.get('recovery_to_orig_logit') or {}).get('mean'))}  "
+          f"pred_matches_orig(sig)={_fmt(sig_c2o.get('pred_patched_matches_orig_rate'))}")
+    print(f"    orig2cf  injection(sig)={_fmt((sig_o2c.get('injection_to_cf_logit') or {}).get('mean'))}  "
+          f"injection(flip_pairs)={_fmt((afp_o2c.get('injection_to_cf_logit') or {}).get('mean'))}  "
+          f"pred_matches_cf(sig)={_fmt(sig_o2c.get('pred_patched_matches_cf_rate'))}")
 
     return {
         "cf2orig": {"agg": agg_c2o, "pairs": cf2orig},
@@ -1612,7 +1767,8 @@ def exp_residual_patching(model, tok, pairs, answer_ids, layer_range, device,
 def exp_context_split(model, tok, all_pairs, answer_ids, heads_by_layer,
                        head_dim, device, max_n, rng, global_warnings,
                        min_effect: float = MIN_EFFECT_THRESHOLD,
-                       scope: str = "final_token") -> dict:
+                       scope: str = "final_token",
+                       mean_activations: dict | None = None) -> dict:
     so_pairs = [p for p in all_pairs if p["family"] == "sexual_orientation"]
 
     split_counts: Counter = Counter()
@@ -1651,6 +1807,7 @@ def exp_context_split(model, tok, all_pairs, answer_ids, heads_by_layer,
                 raw.append(run_ablation_pair(model, tok, pair, answer_ids,
                                              heads_by_layer, head_dim, device,
                                              min_effect=min_effect,
+                                             mean_activations=mean_activations,
                                              scope=scope))
             except Exception:
                 pass
@@ -2347,33 +2504,68 @@ def plot_layer_group(layer_group_results: dict, output_path: Path):
 
 
 def plot_direction_patching(patching_results: dict, output_path: Path):
-    families = [f for f in patching_results if patching_results[f].get("cf2orig")]
-    if not families:
+    def _iter_patch_sets(fam_result: dict) -> list[tuple[str, dict]]:
+        if not fam_result:
+            return []
+        # Back-compat: old shape {cf2orig, orig2cf}
+        if fam_result.get("cf2orig") and fam_result.get("orig2cf"):
+            return [("patch", fam_result)]
+        out = []
+        for k, v in fam_result.items():
+            if isinstance(v, dict) and v.get("cf2orig") and v.get("orig2cf"):
+                out.append((k, v))
+        return out
+
+    entries: list[tuple[str, str, dict]] = []
+    for fam, fam_result in patching_results.items():
+        for set_name, v in _iter_patch_sets(fam_result):
+            entries.append((fam, set_name, v))
+
+    if not entries:
         return
-    fig, axes = plt.subplots(3, len(families), figsize=(5 * len(families), 12), squeeze=False)
-    for col, fam in enumerate(families):
-        r = patching_results[fam]
+
+    fig, axes = plt.subplots(3, len(entries),
+                             figsize=(5 * len(entries), 12),
+                             squeeze=False)
+
+    for col, (fam, set_name, r) in enumerate(entries):
         color = FAMILY_COLORS.get(fam, "grey")
         # Row 0: recovery (cf2orig) and injection (orig2cf)
         ax = axes[0][col]
-        rec = ((r.get("cf2orig", {}).get("agg", {}).get("significant", {})
-                .get("recovery_to_orig_logit") or {}).get("mean") or 0)
-        inj = ((r.get("orig2cf", {}).get("agg", {}).get("significant", {})
-                .get("injection_to_cf_logit") or {}).get("mean") or 0)
-        ax.bar(["CF→Orig\n(Recovery)", "Orig→CF\n(Injection)"],
-               [rec, inj], color=[color, color], alpha=[0.85, 0.5])
+        rec_sig = ((r.get("cf2orig", {}).get("agg", {}).get("significant", {})
+                    .get("recovery_to_orig_logit") or {}).get("mean") or 0)
+        inj_sig = ((r.get("orig2cf", {}).get("agg", {}).get("significant", {})
+                    .get("injection_to_cf_logit") or {}).get("mean") or 0)
+        rec_flip = ((r.get("cf2orig", {}).get("agg", {}).get("answer_flip_pairs", {})
+                     .get("recovery_to_orig_logit") or {}).get("mean") or 0)
+        inj_flip = ((r.get("orig2cf", {}).get("agg", {}).get("answer_flip_pairs", {})
+                     .get("injection_to_cf_logit") or {}).get("mean") or 0)
+
+        x = np.arange(2)
+        w = 0.35
+        b1 = ax.bar(x - w/2, [rec_sig, inj_sig], w, color=color, alpha=0.55, label="sig")
+        b2 = ax.bar(x + w/2, [rec_flip, inj_flip], w, color=color, alpha=0.90, label="answer_flip_pairs")
+        ax.set_xticks(x)
+        ax.set_xticklabels(["CF→Orig\n(Recovery)", "Orig→CF\n(Injection)"])
+        ax.legend(fontsize=7)
         ax.axhline(0, color="k", linewidth=0.5)
         ax.axhline(1, color="grey", linestyle="--", alpha=0.5, linewidth=0.8)
         ax.set_ylabel("Score (↑ = stronger effect)", fontsize=8)
-        ax.set_title(fam.replace("_", "\n"), color=color, fontsize=9, fontweight="bold")
+        title = fam.replace("_", "\n")
+        if set_name and set_name != "patch":
+            title = f"{title}\n[{set_name}]"
+        ax.set_title(title, color=color, fontsize=9, fontweight="bold")
         # Row 1: pred match rates
         ax2 = axes[1][col]
         pm_orig = (r.get("cf2orig", {}).get("agg", {}).get("significant", {})
                    .get("pred_patched_matches_orig_rate") or 0)
         pm_cf   = (r.get("orig2cf", {}).get("agg", {}).get("significant", {})
                    .get("pred_patched_matches_cf_rate") or 0)
-        ax2.bar(["Orig match\n(CF→Orig)", "CF match\n(Orig→CF)"],
-                [pm_orig, pm_cf], color=[color, color], alpha=[0.85, 0.5])
+        bars2 = ax2.bar(["Orig match\n(CF→Orig)", "CF match\n(Orig→CF)"],
+                        [pm_orig, pm_cf], color=[color, color], alpha=1.0)
+        if len(bars2) >= 2:
+            bars2[0].set_alpha(0.85)
+            bars2[1].set_alpha(0.50)
         ax2.set_ylim(0, 1); ax2.set_ylabel("Pred match rate", fontsize=8)
         # Row 2: overshoot rates
         ax3 = axes[2][col]
@@ -2381,8 +2573,11 @@ def plot_direction_patching(patching_results: dict, output_path: Path):
                          .get("overshoot_logit_rate") or 0)
         overshoot_o2c = (r.get("orig2cf", {}).get("agg", {}).get("significant", {})
                          .get("overshoot_logit_rate") or 0)
-        ax3.bar(["CF→Orig\novershoot", "Orig→CF\novershoot"],
-                [overshoot_c2o, overshoot_o2c], color=[color, color], alpha=[0.85, 0.5])
+        bars3 = ax3.bar(["CF→Orig\novershoot", "Orig→CF\novershoot"],
+                        [overshoot_c2o, overshoot_o2c], color=[color, color], alpha=1.0)
+        if len(bars3) >= 2:
+            bars3[0].set_alpha(0.85)
+            bars3[1].set_alpha(0.50)
         ax3.set_ylim(0, 1)
         ax3.set_ylabel("Overshoot rate (sig)", fontsize=8)
         ax3.set_title("Overshoot logit rate", fontsize=8)
@@ -2699,9 +2894,18 @@ def main():
     parser.add_argument("--n_per_group",         type=int, default=5)
     parser.add_argument("--residual_max_pairs",  type=int, default=50)
     parser.add_argument("--mean_act_max_pairs",  type=int, default=50,
-                        help="Pairs used to compute mean activations per family")
+                        help="(Deprecated) Previously used for family-wide means. "
+                             "Mean ablation now uses matched-QID baselines.")
     parser.add_argument("--min_effect", type=float, default=MIN_EFFECT_THRESHOLD)
     parser.add_argument("--seed",       type=int,   default=42)
+    parser.add_argument("--case1_families", nargs="*", default=None,
+                        help="Limit CASE 1 to these families (subset of: "
+                             "gender_identity race sex_gender). Default: all.")
+    parser.add_argument("--case1_start", default="A1",
+                        choices=["A1", "A2", "A3", "A4"],
+                        help="Resume CASE 1 at a specific experiment (skips earlier ones).")
+    parser.add_argument("--skip_case2", action="store_true",
+                        help="Skip CASE 2 (sexual orientation) entirely.")
     parser.add_argument("--run_component_experiments", action="store_true",
                         help="Run C1-C7 component experiments (MLP/attention/residual patching)")
     parser.add_argument("--component_max_pairs", type=int, default=50,
@@ -2722,11 +2926,16 @@ def main():
                              "eligible for C4 within-layer decomposition")
     parser.add_argument("--within_layer_min_n_valid", type=int, default=5,
                         help="Minimum n_valid significant pairs at a layer for C4 eligibility")
+    parser.add_argument("--aggressive_cuda_cache_clear", action="store_true",
+                        help="If set, calls torch.cuda.empty_cache() after each forward pass. "
+                             "Usually slows runs; only use for OOM troubleshooting.")
     args = parser.parse_args()
 
     scope = args.intervention_scope
     min_effect = args.min_effect
     global_warnings: list[str] = []
+    global AGGRESSIVE_CUDA_CACHE_CLEAR
+    AGGRESSIVE_CUDA_CACHE_CLEAR = bool(args.aggressive_cuda_cache_clear)
 
     output_dir = Path(args.output_dir)
     plots_dir  = output_dir / "plots"
@@ -2784,7 +2993,15 @@ def main():
     patching_results = {}
     control_matchedness = {}
 
-    for fam in CASE1_FAMILIES:
+    case1_start_order = {"A1": 1, "A2": 2, "A3": 3, "A4": 4}
+    start_k = case1_start_order.get(args.case1_start, 1)
+
+    def _do_case1(exp: str) -> bool:
+        return case1_start_order[exp] >= start_k
+
+    case1_fams = args.case1_families if args.case1_families else CASE1_FAMILIES
+
+    for fam in case1_fams:
         if fam not in thd:
             print(f"\nSkipping {fam} (not in top_heads.json)")
             _warn_if(True, f"No top_heads entry for {fam}.", global_warnings)
@@ -2814,290 +3031,330 @@ def main():
             _warn_if(True, f"No early heads (layers 0–{args.early_layer_max}) found "
                      f"for {fam}.", global_warnings)
 
-        # ---- Pre-compute mean activations ----
-        all_head_layers = list({l for l, _ in full_heads})
-        print(f"  Computing mean activations ({args.mean_act_max_pairs} pairs, "
-              f"{len(all_head_layers)} layers)...")
-        mean_acts = compute_mean_head_activations(
-            model, tok, focal_pairs, all_head_layers, head_dim, device,
-            max_pairs=args.mean_act_max_pairs, scope=scope
-        )
-        print(f"  Mean activations computed for {len(mean_acts)} layers.")
+        mean_acts = {}
+        if _do_case1("A1") or _do_case1("A2") or _do_case1("A3"):
+            # ---- Pre-compute matched-QID mean activations ----
+            all_head_layers = list({l for l, _ in full_heads})
+            qids_for_means = list({p.get("qid") for p in (focal_pairs + ctrl_pairs) if p.get("qid") is not None})
+            print(f"  Computing QID-matched mean activations ({len(qids_for_means)} QIDs, "
+                  f"{len(all_head_layers)} layers)...")
+            mean_acts = compute_qid_matched_head_activations(
+                model, tok, focal_pairs + ctrl_pairs, all_head_layers, device,
+                scope=scope
+            )
+            print(f"  QID-matched mean activations computed for {len(mean_acts)} QIDs.")
 
         # ----------------------------------------------------------------
         # A1: Individual early-head ablation
         # ----------------------------------------------------------------
-        print(f"\n  A1: Individual ablation ({len(early_heads)} early heads)")
-        per_pair_a1, per_head_a1 = exp_individual_ablation(
-            model, tok, focal_pairs, answer_ids, early_heads,
-            head_dim, device, fam, mean_acts, min_effect=min_effect, scope=scope
-        )
-        exp_dir = make_exp_dir(output_dir, fam, "a1_individual")
-        n_a1_sig = sum(1 for r in per_pair_a1 if r.get("is_significant"))
-        save_experiment(
-            exp_dir,
-            metadata={"family": fam, "experiment": "a1_individual",
-                       "n_heads": len(early_heads), "n_pairs_per_head": len(focal_pairs),
-                       "n_significant_pairs": n_a1_sig,
-                       "early_layer_max": args.early_layer_max,
-                       "ablation_mode": "mean_primary_zero_secondary",
-                       "intervention_scope": scope,
-                       "mean_activation_scope": scope,
-                       "mean_activation_n_pairs": args.mean_act_max_pairs},
-            aggregate=aggregate_v2(per_pair_a1),
-            per_pair=per_pair_a1,
-            per_head=per_head_a1,
-        )
-        # Rank by recovery for the summary
-        per_head_a1_sorted = sorted(
-            [r for r in per_head_a1 if r.get("recovery_to_orig_logit_mean_sig") is not None],
-            key=lambda r: r["recovery_to_orig_logit_mean_sig"], reverse=True
-        )
-        print(f"  Top recovery heads (early): "
-              f"{[(r['head_id'], r['recovery_to_orig_logit_mean_sig']) for r in per_head_a1_sorted[:3]]}")
+        if _do_case1("A1"):
+            print(f"\n  A1: Individual ablation ({len(early_heads)} early heads)")
+            per_pair_a1, per_head_a1 = exp_individual_ablation(
+                model, tok, focal_pairs, answer_ids, early_heads,
+                head_dim, device, fam, mean_acts, min_effect=min_effect, scope=scope
+            )
+            exp_dir = make_exp_dir(output_dir, fam, "a1_individual")
+            n_a1_sig = sum(1 for r in per_pair_a1 if r.get("is_significant"))
+            save_experiment(
+                exp_dir,
+                metadata={"family": fam, "experiment": "a1_individual",
+                          "n_heads": len(early_heads), "n_pairs_per_head": len(focal_pairs),
+                          "n_significant_pairs": n_a1_sig,
+                          "early_layer_max": args.early_layer_max,
+                          "ablation_mode": "mean_primary_zero_secondary",
+                          "intervention_scope": scope,
+                          "mean_activation_scope": scope,
+                              "mean_activation_mode": "qid_matched_orig",
+                              "mean_activation_n_qids": len(mean_acts),
+                              "mean_activation_n_pairs": None},
+                aggregate=aggregate_v2(per_pair_a1),
+                per_pair=per_pair_a1,
+                per_head=per_head_a1,
+            )
+            # Rank by recovery for the summary
+            per_head_a1_sorted = sorted(
+                [r for r in per_head_a1 if r.get("recovery_to_orig_logit_mean_sig") is not None],
+                key=lambda r: r["recovery_to_orig_logit_mean_sig"], reverse=True
+            )
+            print(f"  Top recovery heads (early): "
+                  f"{[(r['head_id'], r['recovery_to_orig_logit_mean_sig']) for r in per_head_a1_sorted[:3]]}")
 
         # ----------------------------------------------------------------
         # A2: Stepwise ablation — early
         # ----------------------------------------------------------------
-        print(f"\n  A2 stepwise (early, {len(early_heads)} heads)")
-        curve_early, final_pairs_early = exp_stepwise_ablation(
-            model, tok, focal_pairs, answer_ids, early_heads,
-            head_dim, device, mean_acts, min_effect=min_effect, scope=scope
-        )
-        stepwise_curves[f"{fam}_early"] = curve_early
-        exp_dir = make_exp_dir(output_dir, fam, "a2_stepwise_early")
-        save_experiment(
-            exp_dir,
-            metadata={"family": fam, "experiment": "a2_stepwise_early",
-                       "n_heads": len(early_heads), "n_pairs": len(focal_pairs),
-                       "ablation_mode": "mean_primary_zero_secondary",
-                       "intervention_scope": scope,
-                       "mean_activation_scope": scope,
-                       "mean_activation_n_pairs": args.mean_act_max_pairs},
-            aggregate=aggregate_v2(final_pairs_early) if final_pairs_early else {},
-            per_pair=final_pairs_early,
-            curve=curve_early,
-        )
-
-        # A2: Stepwise ablation — full
-        print(f"\n  A2 stepwise (full, {len(full_heads)} heads)")
-        curve_full, final_pairs_full = exp_stepwise_ablation(
-            model, tok, focal_pairs, answer_ids, full_heads,
-            head_dim, device, mean_acts, min_effect=min_effect, scope=scope
-        )
-        stepwise_curves[f"{fam}_full"] = curve_full
-        exp_dir = make_exp_dir(output_dir, fam, "a2_stepwise_full")
-        save_experiment(
-            exp_dir,
-            metadata={"family": fam, "experiment": "a2_stepwise_full",
-                       "n_heads": len(full_heads), "n_pairs": len(focal_pairs),
-                       "ablation_mode": "mean_primary_zero_secondary",
-                       "intervention_scope": scope,
-                       "mean_activation_scope": scope,
-                       "mean_activation_n_pairs": args.mean_act_max_pairs},
-            aggregate=aggregate_v2(final_pairs_full) if final_pairs_full else {},
-            per_pair=final_pairs_full,
-            curve=curve_full,
-        )
-
-        # A2: Stepwise — reference controls (full head set, no mean acts for controls)
-        if ctrl_pairs:
-            print(f"\n  A2 stepwise ({ctrl_label}, full heads)")
-            # Use focal mean acts; controls don't have their own (interpretation note)
-            curve_ctrl, final_pairs_ctrl = exp_stepwise_ablation(
-                model, tok, ctrl_pairs, answer_ids, full_heads,
+        curve_early, curve_full = None, None
+        if _do_case1("A2"):
+            print(f"\n  A2 stepwise (early, {len(early_heads)} heads)")
+            curve_early, final_pairs_early = exp_stepwise_ablation(
+                model, tok, focal_pairs, answer_ids, early_heads,
                 head_dim, device, mean_acts, min_effect=min_effect, scope=scope
             )
-            stepwise_curves[f"{fam}_control"] = curve_ctrl
-            exp_dir = make_exp_dir(output_dir, fam, f"a2_{ctrl_label}")
+            stepwise_curves[f"{fam}_early"] = curve_early
+            exp_dir = make_exp_dir(output_dir, fam, "a2_stepwise_early")
             save_experiment(
                 exp_dir,
-                metadata={"family": fam, "experiment": f"a2_{ctrl_label}",
-                           "n_heads": len(full_heads), "n_pairs": len(ctrl_pairs),
-                           "frac_matched": frac_matched, "ctrl_label": ctrl_label,
-                           "note": ("Focal heads applied to control pairs. "
-                                    "Stage 3 selected focal heads via focal-vs-control "
-                                    "contrasts; Stage 4 tests whether those heads "
-                                    "causally affect focal families more than reference "
-                                    "controls. Controls serve as a perturbation baseline, "
-                                    "not a fully symmetric target class.")},
-                aggregate=aggregate_v2(final_pairs_ctrl) if final_pairs_ctrl else {},
-                per_pair=final_pairs_ctrl,
-                curve=curve_ctrl,
+                metadata={"family": fam, "experiment": "a2_stepwise_early",
+                          "n_heads": len(early_heads), "n_pairs": len(focal_pairs),
+                          "ablation_mode": "mean_primary_zero_secondary",
+                          "intervention_scope": scope,
+                          "mean_activation_scope": scope,
+                          "mean_activation_mode": "qid_matched_orig",
+                          "mean_activation_n_qids": len(mean_acts),
+                          "mean_activation_n_pairs": None},
+                aggregate=aggregate_v2(final_pairs_early) if final_pairs_early else {},
+                per_pair=final_pairs_early,
+                curve=curve_early,
             )
 
-        # ---- Localization summary from stepwise ----
-        killer_results[fam] = build_localization_summary(
-            fam, curve_early, curve_full, early_heads, full_heads, args.early_layer_max
-        )
-        k = killer_results[fam]
-        print(f"\n  *** Localization: "
-              f"recovery_early={_fmt(k['recovery_early'])}  "
-              f"recovery_full={_fmt(k['recovery_full'])}  "
-              f"early_share={_fmt(k['early_share_recovery'])}%  ***")
-        _warn_if(
-            k["recovery_full"] is not None
-            and k["destructive_cf_full"] is not None
-            and k["destructive_cf_full"] < -0.1
-            and (k["recovery_full"] or 0) < 0.05,
-            f"{fam}: destructive ablation is strongly negative while recovery is near zero "
-            f"— OOD collateral damage likely dominates the destructive metric.",
-            global_warnings
-        )
+            # A2: Stepwise ablation — full
+            print(f"\n  A2 stepwise (full, {len(full_heads)} heads)")
+            curve_full, final_pairs_full = exp_stepwise_ablation(
+                model, tok, focal_pairs, answer_ids, full_heads,
+                head_dim, device, mean_acts, min_effect=min_effect, scope=scope
+            )
+            stepwise_curves[f"{fam}_full"] = curve_full
+            exp_dir = make_exp_dir(output_dir, fam, "a2_stepwise_full")
+            save_experiment(
+                exp_dir,
+                metadata={"family": fam, "experiment": "a2_stepwise_full",
+                          "n_heads": len(full_heads), "n_pairs": len(focal_pairs),
+                          "ablation_mode": "mean_primary_zero_secondary",
+                          "intervention_scope": scope,
+                          "mean_activation_scope": scope,
+                          "mean_activation_mode": "qid_matched_orig",
+                          "mean_activation_n_qids": len(mean_acts),
+                          "mean_activation_n_pairs": None},
+                aggregate=aggregate_v2(final_pairs_full) if final_pairs_full else {},
+                per_pair=final_pairs_full,
+                curve=curve_full,
+            )
+
+            # A2: Stepwise — reference controls (full head set, no mean acts for controls)
+            if ctrl_pairs:
+                print(f"\n  A2 stepwise ({ctrl_label}, full heads)")
+                # Use focal mean acts; controls don't have their own (interpretation note)
+                curve_ctrl, final_pairs_ctrl = exp_stepwise_ablation(
+                    model, tok, ctrl_pairs, answer_ids, full_heads,
+                    head_dim, device, mean_acts, min_effect=min_effect, scope=scope
+                )
+                stepwise_curves[f"{fam}_control"] = curve_ctrl
+                exp_dir = make_exp_dir(output_dir, fam, f"a2_{ctrl_label}")
+                save_experiment(
+                    exp_dir,
+                    metadata={"family": fam, "experiment": f"a2_{ctrl_label}",
+                              "n_heads": len(full_heads), "n_pairs": len(ctrl_pairs),
+                              "frac_matched": frac_matched, "ctrl_label": ctrl_label,
+                              "note": ("Focal heads applied to control pairs. "
+                                       "Stage 3 selected focal heads via focal-vs-control "
+                                       "contrasts; Stage 4 tests whether those heads "
+                                       "causally affect focal families more than reference "
+                                       "controls. Controls serve as a perturbation baseline, "
+                                       "not a fully symmetric target class.")},
+                    aggregate=aggregate_v2(final_pairs_ctrl) if final_pairs_ctrl else {},
+                    per_pair=final_pairs_ctrl,
+                    curve=curve_ctrl,
+                )
+
+            # ---- Localization summary from stepwise ----
+            killer_results[fam] = build_localization_summary(
+                fam, curve_early, curve_full, early_heads, full_heads, args.early_layer_max
+            )
+            k = killer_results[fam]
+            print(f"\n  *** Localization: "
+                  f"recovery_early={_fmt(k['recovery_early'])}  "
+                  f"recovery_full={_fmt(k['recovery_full'])}  "
+                  f"early_share={_fmt(k['early_share_recovery'])}%  ***")
+            _warn_if(
+                k["recovery_full"] is not None
+                and k["destructive_cf_full"] is not None
+                and k["destructive_cf_full"] < -0.1
+                and (k["recovery_full"] or 0) < 0.05,
+                f"{fam}: destructive ablation is strongly negative while recovery is near zero "
+                f"— OOD collateral damage likely dominates the destructive metric.",
+                global_warnings
+            )
 
         # ----------------------------------------------------------------
         # A3: Layer-group comparison
         # ----------------------------------------------------------------
-        print(f"\n  A3: Layer-group comparison")
-        layer_groups = {"early": early_range, "mid": mid_range, "late": late_range}
-        group_agg, per_pair_a3 = exp_layer_group_ablation(
-            model, tok, focal_pairs, answer_ids, thd, fam, layer_groups,
-            head_dim, device, args.n_per_group, mean_acts, min_effect=min_effect,
-            scope=scope
-        )
-        layer_group_results[fam] = group_agg
-        exp_dir = make_exp_dir(output_dir, fam, "a3_layer_groups")
-        save_experiment(
-            exp_dir,
-            metadata={"family": fam, "experiment": "a3_layer_groups",
-                       "n_per_group": args.n_per_group,
-                       "ablation_mode": "mean_primary_zero_secondary",
-                       "intervention_scope": scope,
-                       "mean_activation_scope": scope,
-                       "mean_activation_n_pairs": args.mean_act_max_pairs},
-            aggregate={g: group_agg[g] for g in group_agg},
-            per_pair=per_pair_a3,
-        )
+        if _do_case1("A3"):
+            print(f"\n  A3: Layer-group comparison")
+            layer_groups = {"early": early_range, "mid": mid_range, "late": late_range}
+            group_agg, per_pair_a3 = exp_layer_group_ablation(
+                model, tok, focal_pairs, answer_ids, thd, fam, layer_groups,
+                head_dim, device, args.n_per_group, mean_acts, min_effect=min_effect,
+                scope=scope
+            )
+            layer_group_results[fam] = group_agg
+            exp_dir = make_exp_dir(output_dir, fam, "a3_layer_groups")
+            save_experiment(
+                exp_dir,
+                metadata={"family": fam, "experiment": "a3_layer_groups",
+                          "n_per_group": args.n_per_group,
+                          "ablation_mode": "mean_primary_zero_secondary",
+                          "intervention_scope": scope,
+                          "mean_activation_scope": scope,
+                          "mean_activation_mode": "qid_matched_orig",
+                          "mean_activation_n_qids": len(mean_acts),
+                          "mean_activation_n_pairs": None},
+                aggregate={g: group_agg[g] for g in group_agg},
+                per_pair=per_pair_a3,
+            )
 
         # ----------------------------------------------------------------
         # A4: Direction patching
         # ----------------------------------------------------------------
-        print(f"\n  A4: Direction patching")
-        hbl_for_patching = heads_to_layer_dict(early_heads if early_heads else full_heads[:5])
-        pat = exp_direction_patching(
-            model, tok, focal_pairs, answer_ids,
-            hbl_for_patching, head_dim, device, min_effect=min_effect
-        )
-        patching_results[fam] = pat
-        exp_dir = make_exp_dir(output_dir, fam, "a4_direction_patching")
-        save_experiment(
-            exp_dir,
-            metadata={"family": fam, "experiment": "a4_direction_patching",
-                       "heads_used": [f"L{l:02d}H{h:02d}" for l, h in
-                                      (early_heads if early_heads else full_heads[:5])],
-                       "note": "cf2orig = recovery (PRIMARY). orig2cf = injection (PRIMARY)."},
-            aggregate={"cf2orig": pat["cf2orig"]["agg"],
-                        "orig2cf": pat["orig2cf"]["agg"]},
-            per_pair=pat["cf2orig"]["pairs"] + pat["orig2cf"]["pairs"],
-        )
-        # Save split CSVs for easier inspection
-        c2o_dir = make_exp_dir(output_dir, fam, "a4_direction_patching")
-        save_csv(pat["cf2orig"]["pairs"], c2o_dir / "cf2orig_pairs.csv")
-        save_csv(pat["orig2cf"]["pairs"], c2o_dir / "orig2cf_pairs.csv")
+        if _do_case1("A4"):
+            print(f"\n  A4: Direction patching")
+            # Requested: run A4 for both early-top20 and full-top20 head sets
+            early_heads_upto20 = filter_heads_by_layer(thd, fam, early_range, 20)
+            full_top20  = top_n_heads(thd, fam, 20)
+
+            patch_sets = [
+                ("early_heads_upto20", early_heads_upto20),
+                ("full_top20",  full_top20),
+            ]
+
+            fam_patch_results: dict = {}
+            for set_name, heads in patch_sets:
+                if not heads:
+                    continue
+                hbl_for_patching = heads_to_layer_dict(heads)
+                pat = exp_direction_patching(
+                    model, tok, focal_pairs, answer_ids,
+                    hbl_for_patching, head_dim, device,
+                    min_effect=min_effect, scope=scope
+                )
+                fam_patch_results[set_name] = pat
+
+                exp_label = f"a4_direction_patching_{set_name}"
+                exp_dir = make_exp_dir(output_dir, fam, exp_label)
+                save_experiment(
+                    exp_dir,
+                    metadata={"family": fam, "experiment": exp_label,
+                              "patch_set": set_name,
+                              "heads_used": [f"L{l:02d}H{h:02d}" for l, h in heads],
+                              "intervention_scope": scope,
+                              "note": "cf2orig = recovery (PRIMARY). orig2cf = injection (PRIMARY)."},
+                    aggregate={"cf2orig": pat["cf2orig"]["agg"],
+                               "orig2cf": pat["orig2cf"]["agg"]},
+                    per_pair=pat["cf2orig"]["pairs"] + pat["orig2cf"]["pairs"],
+                )
+                save_csv(pat["cf2orig"]["pairs"], exp_dir / "cf2orig_pairs.csv")
+                save_csv(pat["orig2cf"]["pairs"], exp_dir / "orig2cf_pairs.csv")
+
+            patching_results[fam] = fam_patch_results
 
     # =======================================================================
     # CASE 2: Sexual Orientation
     # =======================================================================
-    print(f"\n{'='*60}")
-    print("CASE 2: SEXUAL ORIENTATION")
-    print('='*60)
+    if args.skip_case2:
+        print("\nSkipping CASE 2 (requested).")
+        so_focal = []
+        b1_results, b2_results, b3_results = {}, {}, {}
+    else:
+        print(f"\n{'='*60}")
+        print("CASE 2: SEXUAL ORIENTATION")
+        print('='*60)
 
-    so_focal = sample_pairs(all_pairs, "sexual_orientation", args.max_pairs, rng)
-    b1_results: dict = {}
-    b2_results: dict = {}
-    b3_results: dict = {}
+        so_focal = sample_pairs(all_pairs, "sexual_orientation", args.max_pairs, rng)
+        b1_results: dict = {}
+        b2_results: dict = {}
+        b3_results: dict = {}
 
-    if so_focal and "sexual_orientation" in thd:
-        # ---- Mean activations for SO ----
-        so_full_heads = top_n_heads(thd, "sexual_orientation", args.top_k_full)
-        so_head_layers = list({l for l, _ in so_full_heads})
-        print(f"  Computing SO mean activations ({args.mean_act_max_pairs} pairs, "
-              f"{len(so_head_layers)} layers)...")
-        so_mean_acts = compute_mean_head_activations(
-            model, tok, so_focal, so_head_layers, head_dim, device,
-            max_pairs=args.mean_act_max_pairs, scope=scope
-        )
-        print(f"  Mean activations computed for {len(so_mean_acts)} layers.")
-
-        # ---- B1: Multi-head ablation at 3 scales ----
-        for k_so in [5, 10, args.top_k_full]:
-            heads_so = top_n_heads(thd, "sexual_orientation", k_so)
-            print(f"\n  B1: Stepwise ablation (top-{k_so})")
-            curve_so, final_pairs_so = exp_stepwise_ablation(
-                model, tok, so_focal, answer_ids, heads_so,
-                head_dim, device, so_mean_acts, min_effect=min_effect, scope=scope
+        if so_focal and "sexual_orientation" in thd:
+            # ---- Mean activations for SO ----
+            so_full_heads = top_n_heads(thd, "sexual_orientation", args.top_k_full)
+            so_head_layers = list({l for l, _ in so_full_heads})
+            so_qids = list({p.get("qid") for p in so_focal if p.get("qid") is not None})
+            print(f"  Computing SO QID-matched mean activations ({len(so_qids)} QIDs, "
+                  f"{len(so_head_layers)} layers)...")
+            so_mean_acts = compute_qid_matched_head_activations(
+                model, tok, so_focal, so_head_layers, device,
+                scope=scope
             )
-            b1_results[f"top_{k_so}"] = curve_so
-            stepwise_curves[f"sexual_orientation_top{k_so}"] = curve_so
-            scale_label = f"b1_top{k_so}"
-            exp_dir = make_exp_dir(output_dir, "sexual_orientation", scale_label)
-            save_experiment(
-                exp_dir,
-                metadata={"family": "sexual_orientation", "experiment": scale_label,
-                           "n_heads": len(heads_so), "n_pairs": len(so_focal),
-                           "ablation_mode": "mean_primary_zero_secondary"},
-                aggregate=aggregate_v2(final_pairs_so) if final_pairs_so else {},
-                per_pair=final_pairs_so,
-                curve=curve_so,
-            )
+            print(f"  SO QID-matched mean activations computed for {len(so_mean_acts)} QIDs.")
 
-        _warn_if(
-            not b1_results,
-            "No B1 results for sexual_orientation.", global_warnings
-        )
-
-        # ---- B2: Residual stream patching ----
-        print(f"\n  B2: Residual stream patching ({n_layers} layers, "
-              f"{args.residual_max_pairs} pairs)")
-        b2_results = exp_residual_patching(
-            model, tok, so_focal[:args.residual_max_pairs],
-            answer_ids, range(n_layers), device, min_effect=min_effect
-        )
-        exp_dir = make_exp_dir(output_dir, "sexual_orientation", "b2_residual_patching")
-        n_b2_sig = sum(1 for r in b2_results["per_pair"] if r.get("is_significant"))
-        _warn_if(
-            n_b2_sig < 5,
-            f"Only {n_b2_sig} significant pairs in B2 residual patching — "
-            f"results may be unstable.", global_warnings
-        )
-        save_experiment(
-            exp_dir,
-            metadata={"family": "sexual_orientation", "experiment": "b2_residual_patching",
-                       "n_layers": n_layers, "n_pairs": len(so_focal[:args.residual_max_pairs]),
-                       "n_significant": n_b2_sig,
-                       "note": ("Identifies carrier layers where patching CF→orig residual "
-                                "stream moves the run back toward original behaviour. "
-                                "These are transport layers, not necessarily encoding layers.")},
-            aggregate=b2_results["layer_agg"],
-            per_pair=b2_results["per_pair"],
-            per_layer=b2_results["per_layer_rows"],
-        )
-
-        # ---- B3: Context sensitivity split ----
-        print(f"\n  B3: Context sensitivity split")
-        hbl_so = heads_to_layer_dict(so_full_heads)
-        b3_results = exp_context_split(
-            model, tok, all_pairs, answer_ids, hbl_so, head_dim, device,
-            args.max_pairs, rng, global_warnings, min_effect=min_effect, scope=scope
-        )
-        for split_name in ["partner", "explicit"]:
-            if b3_results.get(split_name, {}).get("pairs"):
-                exp_dir = make_exp_dir(output_dir, "sexual_orientation",
-                                       f"b3_context_split_{split_name}")
+            # ---- B1: Multi-head ablation at 3 scales ----
+            for k_so in [5, 10, args.top_k_full]:
+                heads_so = top_n_heads(thd, "sexual_orientation", k_so)
+                print(f"\n  B1: Stepwise ablation (top-{k_so})")
+                curve_so, final_pairs_so = exp_stepwise_ablation(
+                    model, tok, so_focal, answer_ids, heads_so,
+                    head_dim, device, so_mean_acts, min_effect=min_effect, scope=scope
+                )
+                b1_results[f"top_{k_so}"] = curve_so
+                stepwise_curves[f"sexual_orientation_top{k_so}"] = curve_so
+                scale_label = f"b1_top{k_so}"
+                exp_dir = make_exp_dir(output_dir, "sexual_orientation", scale_label)
                 save_experiment(
                     exp_dir,
-                    metadata={"family": "sexual_orientation",
-                               "experiment": f"b3_context_split_{split_name}",
-                               "split": split_name,
-                               "n_pairs": b3_results[split_name]["n"]},
-                    aggregate=b3_results[split_name]["agg"],
-                    per_pair=b3_results[split_name]["pairs"],
+                    metadata={"family": "sexual_orientation", "experiment": scale_label,
+                              "n_heads": len(heads_so), "n_pairs": len(so_focal),
+                              "ablation_mode": "mean_primary_zero_secondary"},
+                    aggregate=aggregate_v2(final_pairs_so) if final_pairs_so else {},
+                    per_pair=final_pairs_so,
+                    curve=curve_so,
                 )
-    else:
-        print("  Skipping Case 2 (no SO pairs or no SO top_heads).")
-        _warn_if(not so_focal,     "No sexual-orientation pairs found.", global_warnings)
-        _warn_if("sexual_orientation" not in thd,
-                 "sexual_orientation not in top_heads.json.", global_warnings)
+
+            _warn_if(
+                not b1_results,
+                "No B1 results for sexual_orientation.", global_warnings
+            )
+
+            # ---- B2: Residual stream patching ----
+            print(f"\n  B2: Residual stream patching ({n_layers} layers, "
+                  f"{args.residual_max_pairs} pairs)")
+            b2_results = exp_residual_patching(
+                model, tok, so_focal[:args.residual_max_pairs],
+                answer_ids, range(n_layers), device, min_effect=min_effect
+            )
+            exp_dir = make_exp_dir(output_dir, "sexual_orientation", "b2_residual_patching")
+            n_b2_sig = sum(1 for r in b2_results["per_pair"] if r.get("is_significant"))
+            _warn_if(
+                n_b2_sig < 5,
+                f"Only {n_b2_sig} significant pairs in B2 residual patching — "
+                f"results may be unstable.", global_warnings
+            )
+            save_experiment(
+                exp_dir,
+                metadata={"family": "sexual_orientation", "experiment": "b2_residual_patching",
+                          "n_layers": n_layers, "n_pairs": len(so_focal[:args.residual_max_pairs]),
+                          "n_significant": n_b2_sig,
+                          "note": ("Identifies carrier layers where patching CF→orig residual "
+                                   "stream moves the run back toward original behaviour. "
+                                   "These are transport layers, not necessarily encoding layers.")},
+                aggregate=b2_results["layer_agg"],
+                per_pair=b2_results["per_pair"],
+                per_layer=b2_results["per_layer_rows"],
+            )
+
+            # ---- B3: Context sensitivity split ----
+            print(f"\n  B3: Context sensitivity split")
+            hbl_so = heads_to_layer_dict(so_full_heads)
+            b3_results = exp_context_split(
+                model, tok, all_pairs, answer_ids, hbl_so, head_dim, device,
+                args.max_pairs, rng, global_warnings, min_effect=min_effect, scope=scope,
+                mean_activations=so_mean_acts,
+            )
+            for split_name in ["partner", "explicit"]:
+                if b3_results.get(split_name, {}).get("pairs"):
+                    exp_dir = make_exp_dir(output_dir, "sexual_orientation",
+                                           f"b3_context_split_{split_name}")
+                    save_experiment(
+                        exp_dir,
+                        metadata={"family": "sexual_orientation",
+                                  "experiment": f"b3_context_split_{split_name}",
+                                  "split": split_name,
+                                  "n_pairs": b3_results[split_name]["n"]},
+                        aggregate=b3_results[split_name]["agg"],
+                        per_pair=b3_results[split_name]["pairs"],
+                    )
+        else:
+            print("  Skipping Case 2 (no SO pairs or no SO top_heads).")
+            _warn_if(not so_focal, "No sexual-orientation pairs found.", global_warnings)
+            _warn_if("sexual_orientation" not in thd,
+                     "sexual_orientation not in top_heads.json.", global_warnings)
 
     # =======================================================================
     # C1–C7: Component experiments (residual / MLP / attention patching)
@@ -3450,6 +3707,46 @@ def main():
     def _get_sig_stat(agg_dict, metric, stratum="significant"):
         return (agg_dict.get(stratum, {}).get(metric) or {}).get("mean")
 
+    def _patching_set_summary(pat: dict) -> dict:
+        return {
+            "cf2orig_recovery_sig": _get_sig_stat(
+                pat["cf2orig"]["agg"],
+                "recovery_to_orig_logit"
+            ),
+            "cf2orig_recovery_answer_flip_pairs": _get_sig_stat(
+                pat["cf2orig"]["agg"],
+                "recovery_to_orig_logit",
+                stratum="answer_flip_pairs",
+            ),
+            "orig2cf_injection_sig": _get_sig_stat(
+                pat["orig2cf"]["agg"],
+                "injection_to_cf_logit"
+            ),
+            "orig2cf_injection_answer_flip_pairs": _get_sig_stat(
+                pat["orig2cf"]["agg"],
+                "injection_to_cf_logit",
+                stratum="answer_flip_pairs",
+            ),
+            "n_answer_flip_pairs": int(
+                (pat.get("cf2orig", {}).get("agg", {}).get("answer_flip_pairs", {}) or {}).get("n", 0)
+            ),
+            "cf2orig_pred_matches_orig_rate_sig":
+                pat["cf2orig"]["agg"].get("significant", {}).get("pred_patched_matches_orig_rate"),
+        }
+
+    patching_summaries: dict = {}
+    for fam, fam_pat in patching_results.items():
+        # Back-compat: old shape {cf2orig, orig2cf}
+        if isinstance(fam_pat, dict) and fam_pat.get("cf2orig") and fam_pat.get("orig2cf"):
+            patching_summaries[fam] = {"patch": _patching_set_summary(fam_pat)}
+            continue
+        fam_sets = {}
+        if isinstance(fam_pat, dict):
+            for set_name, pat in fam_pat.items():
+                if isinstance(pat, dict) and pat.get("cf2orig") and pat.get("orig2cf"):
+                    fam_sets[set_name] = _patching_set_summary(pat)
+        patching_summaries[fam] = fam_sets
+
     summary = {
         "estimand_definition": {
             "primary_estimand": "behavioral_recovery",
@@ -3492,22 +3789,7 @@ def main():
             }
             for fam, r in killer_results.items()
         },
-        "patching_summaries": {
-            fam: {
-                "cf2orig_recovery_sig": _get_sig_stat(
-                    patching_results[fam]["cf2orig"]["agg"],
-                    "recovery_to_orig_logit"
-                ),
-                "orig2cf_injection_sig": _get_sig_stat(
-                    patching_results[fam]["orig2cf"]["agg"],
-                    "injection_to_cf_logit"
-                ),
-                "cf2orig_pred_matches_orig_rate_sig":
-                    patching_results[fam]["cf2orig"]["agg"]
-                    .get("significant", {}).get("pred_patched_matches_orig_rate"),
-            }
-            for fam in patching_results
-        },
+        "patching_summaries": patching_summaries,
         "so_residual_patching_top_recovery_layers": (
             sorted(
                 [(r["layer"], r.get("recovery_to_orig_logit_mean"))
@@ -3528,6 +3810,11 @@ def main():
                 "mean-ablating focal heads on the CF run. 0.0 = no change. "
                 "Negative = ablation pushed run further from original."
             ),
+            "recovery_to_orig_prob": (
+                "EXPLORATORY metric. Computed in probability space; not gated by the "
+                "logit-scale --min_effect. Gated only by a tiny epsilon for numerical "
+                "stability, so treat as descriptive rather than headline evidence."
+            ),
             "destructive_causal_fraction_logit": (
                 "SECONDARY metric (zero-ablation). "
                 "Fraction of |Δ gold logit| eliminated by zeroing focal heads. "
@@ -3536,10 +3823,9 @@ def main():
                 "against causal involvement. Use recovery_to_orig_logit as primary evidence."
             ),
             "mean_ablation": (
-                "Mean activations computed from original prompts in the focal pair set "
-                f"(up to {args.mean_act_max_pairs} pairs). Replaces head outputs with "
-                "their mean representation, avoiding the out-of-distribution activations "
-                "that cause zero-ablation to produce spurious negative fractions."
+                "Matched-QID mean ablation: for each pair, replaces focal head outputs "
+                "with the baseline captured from the ORIGINAL prompt for the same QID. "
+                "This avoids OOD zeros and avoids mixing baselines across unrelated questions."
             ),
             "early_share_recovery": (
                 "recovery_early / recovery_full × 100. "
@@ -3550,6 +3836,10 @@ def main():
                 "For orig2cf direction patching: how much of the CF delta was induced "
                 "by injecting CF head activations into the original run. "
                 "1.0 = full induction. <0 = injection moved away from CF."
+            ),
+            "injection_to_cf_prob": (
+                "EXPLORATORY metric. Probability-space analogue of injection_to_cf_logit; "
+                "interpret cautiously and do not compare directly to logit-scale thresholds."
             ),
         },
         "component_localization": {
