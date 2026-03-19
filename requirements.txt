@@ -1,0 +1,13 @@
+numpy
+pandas
+scipy
+scikit-learn
+matplotlib
+umap-learn
+
+torch
+transformers
+datasets
+
+openai
+python-dotenv
