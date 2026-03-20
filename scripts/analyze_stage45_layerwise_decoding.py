@@ -617,17 +617,30 @@ def _flush_chunk_to_disk(
     chunks_dir = cache_dir / "chunks"
     chunks_dir.mkdir(parents=True, exist_ok=True)
     chunk_path = chunks_dir / f"{chunk_id}.npz"
-    tmp_path = chunks_dir / f"{chunk_id}.npz.tmp"
+    fd = None
+    tmp_path = None
     try:
-        # Write to an open file handle so np.savez cannot append .npz
-        with open(tmp_path, "wb") as f:
+        # Use a uniquely-named temp file that *ends with .npz*, and write via an
+        # open handle so NumPy never auto-appends extensions.
+        fd, tmp_name = tempfile.mkstemp(prefix=f"{chunk_id}_", suffix=".npz", dir=chunks_dir)
+        tmp_path = Path(tmp_name)
+        with os.fdopen(fd, "wb") as f:
+            fd = None  # ownership transferred to file object
             np.savez(f, **arrays)
             f.flush()
             os.fsync(f.fileno())
         os.replace(str(tmp_path), str(chunk_path))  # atomic on POSIX
     except BaseException:
-        if tmp_path.exists():
-            tmp_path.unlink()
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if tmp_path is not None and tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
         raise
 
 
