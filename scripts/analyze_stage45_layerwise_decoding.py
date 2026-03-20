@@ -614,16 +614,20 @@ def _flush_chunk_to_disk(
         arrays[f"cf_{sc}"] = np.array(buf_cf[sc], dtype=np.float32)
         arrays[f"valid_{sc}"] = np.array(buf_valid[sc], dtype=bool)
 
-    chunk_path = cache_dir / "chunks" / f"{chunk_id}.npz"
-    tmp_fd, tmp_path = tempfile.mkstemp(
-        suffix=".npz.tmp", dir=cache_dir / "chunks")
-    os.close(tmp_fd)
+    chunks_dir = cache_dir / "chunks"
+    chunks_dir.mkdir(parents=True, exist_ok=True)
+    chunk_path = chunks_dir / f"{chunk_id}.npz"
+    tmp_path = chunks_dir / f"{chunk_id}.npz.tmp"
     try:
-        np.savez(tmp_path, **arrays)
-        os.rename(tmp_path, str(chunk_path))  # atomic on POSIX
+        # Write to an open file handle so np.savez cannot append .npz
+        with open(tmp_path, "wb") as f:
+            np.savez(f, **arrays)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(str(tmp_path), str(chunk_path))  # atomic on POSIX
     except BaseException:
-        if os.path.exists(tmp_path):
-            os.unlink(tmp_path)
+        if tmp_path.exists():
+            tmp_path.unlink()
         raise
 
 
@@ -640,17 +644,18 @@ def _save_pair_index(cache_dir: Path, entries: list[dict]):
     path = cache_dir / "pair_index.csv"
     if not entries:
         return
-    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".csv.tmp", dir=cache_dir)
-    os.close(tmp_fd)
+    tmp_path = path.with_suffix(".csv.tmp")
     try:
         with open(tmp_path, "w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=_PAIR_INDEX_FIELDS, extrasaction="ignore")
             w.writeheader()
             w.writerows(entries)
-        os.rename(tmp_path, str(path))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(str(tmp_path), str(path))
     except BaseException:
-        if os.path.exists(tmp_path):
-            os.unlink(tmp_path)
+        if tmp_path.exists():
+            tmp_path.unlink()
         raise
 
 
