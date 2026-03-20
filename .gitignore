@@ -32,6 +32,7 @@ extractions_v*/**
 stage*_results/**
 stage*_output/**
 stage*_outputs/**
+stage45_results*/
 artifacts/**
 outputs/**
 medqa_audit/
