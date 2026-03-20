@@ -454,9 +454,17 @@ def make_token_positions(n_tokens: int, token_set: str,
 def _save_csv(rows: list[dict], path: Path):
     if not rows:
         return
-    fieldnames = list(rows[0].keys())
+
+    fieldnames = []
+    seen = set()
+    for row in rows:
+        for k in row.keys():
+            if k not in seen:
+                seen.add(k)
+                fieldnames.append(k)
+
     with open(path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         w.writeheader()
         w.writerows(rows)
 
