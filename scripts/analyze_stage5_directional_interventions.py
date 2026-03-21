@@ -1409,7 +1409,10 @@ def compute_directions(
         sum_cf = {l: np.zeros(hidden_size, dtype=np.float64)
                   for l in target_layers}
         n_irr = 0
-        n_invalid_pool = 0
+        # Split invalidity causes for clearer reporting. (Fix F)
+        n_invalid_span = 0
+        n_invalid_pooling = 0
+        n_invalid_pool = 0  # backward-compat aggregate
 
         # Issue 6: When token_set is span-dependent, cache key must
         # include span geometry because different CFs of the same qid
@@ -1432,6 +1435,7 @@ def compute_directions(
                 es, eeo, eec, span_valid, span_reason = find_edited_span(orig_ids, cf_ids)
                 if not span_valid:
                     # Fix E: do not silently fall back to a bogus span.
+                    n_invalid_span += 1
                     n_invalid_pool += 1
                     _diag_inc(family, "invalid_span_skips_directions")
                     continue
@@ -1461,6 +1465,7 @@ def compute_directions(
                     o_pooled[l] = vec
                 del o_hidden
                 if skip:
+                    n_invalid_pooling += 1
                     n_invalid_pool += 1
                     _diag_inc(family, "invalid_pool_skips_directions")
                     continue
@@ -1482,6 +1487,7 @@ def compute_directions(
                 sum_orig[l] += o_pooled[l].astype(np.float64)
             del c_hidden
             if skip:
+                n_invalid_pooling += 1
                 n_invalid_pool += 1
                 _diag_inc(family, "invalid_pool_skips_directions")
                 continue
@@ -1595,6 +1601,8 @@ def compute_directions(
             "m_hat": m_hat, "m_raw": m_raw, "m_norm": m_norm,
             "n_irr_used": n_irr, "n_rel_used": n_rel,
             "n_invalid_pool": n_invalid_pool,
+            "n_invalid_span": n_invalid_span,
+            "n_invalid_pooling": n_invalid_pooling,
             "token_set_for_attribute_direction": token_set,
             "token_set_for_relevance_direction": rel_ts,
             "pooling_mismatch": pooling_mismatch,
@@ -1623,6 +1631,8 @@ def compute_directions(
             "n_irr_used": n_irr,
             "n_rel_used": n_rel,
             "n_invalid_pool": n_invalid_pool,
+            "n_invalid_span": n_invalid_span,
+            "n_invalid_pooling": n_invalid_pooling,
             "target_layers": target_layers,
             "token_set_for_attribute_direction": token_set,
             "token_set_for_relevance_direction": rel_ts,
@@ -1638,7 +1648,8 @@ def compute_directions(
 
         print(f"  Saved directions for {family} "
               f"(n_irr={n_irr}, n_rel={n_rel}, "
-              f"invalid_pool={n_invalid_pool})")
+              f"invalid_span={n_invalid_span}, "
+              f"invalid_pooling={n_invalid_pooling})")
         orig_cache.clear()
         gc.collect()
 
@@ -1705,6 +1716,8 @@ def load_directions(output_dir: Path, target_layers: list[int],
             "n_irr_used": meta.get("n_irr_used", 0),
             "n_rel_used": meta.get("n_rel_used", 0),
             "n_invalid_pool": meta.get("n_invalid_pool", 0),
+            "n_invalid_span": meta.get("n_invalid_span", 0),
+            "n_invalid_pooling": meta.get("n_invalid_pooling", 0),
             "token_set_for_attribute_direction": meta.get(
                 "token_set_for_attribute_direction"),
             "token_set_for_relevance_direction": meta.get(
