@@ -1740,6 +1740,7 @@ def select_best_layers(
     pairs_ctrl: list,
     directions: dict,
     target_layers: list[int],
+    hidden_size: int,
     max_pairs: int,
     alpha: float,
     token_set: str,
@@ -3531,6 +3532,7 @@ def main():
             model, tok, device, answer_ids,
             data["pairs_irr"], data["pairs_ctrl"],
             directions, target_layers,
+            hidden_size,
             args.max_pairs, args.alpha, args.token_set, rng, out)
         if not args.skip_plots:
             plot_site_selection(out)
