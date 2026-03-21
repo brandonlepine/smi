@@ -133,6 +133,8 @@ import csv
 import gc
 import json
 import re
+import shutil
+import tempfile
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -149,6 +151,118 @@ try:
 except ImportError:
     HAS_PLT = False
     print("Warning: matplotlib not available — plots will be skipped")
+
+
+# ===================================================================
+# Run-level diagnostics (machine-readable)  (Fix F)
+# ===================================================================
+
+RUN_DIAGNOSTICS: dict | None = None
+
+
+def _atomic_write_json(path: Path, obj: dict):
+    """Write JSON atomically so partial runs still flush diagnostics. (Fix F)"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
+    try:
+        with open(fd, "w") as f:
+            json.dump(obj, f, indent=2)
+            f.flush()
+        Path(tmp).replace(path)
+    finally:
+        try:
+            Path(tmp).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _diag_init(config: dict):
+    global RUN_DIAGNOSTICS
+    RUN_DIAGNOSTICS = {
+        "run_config": config,
+        "by_family": defaultdict(lambda: defaultdict(int)),
+        "notes": [],
+        "aborted": False,
+        "last_error": None,
+    }
+
+
+def _diag_inc(family: str | None, key: str, n: int = 1):
+    if RUN_DIAGNOSTICS is None:
+        return
+    fam = family if family is not None else "__unknown__"
+    RUN_DIAGNOSTICS["by_family"][fam][key] += int(n)
+
+
+def _diag_set(key: str, value):
+    if RUN_DIAGNOSTICS is None:
+        return
+    RUN_DIAGNOSTICS[key] = value
+
+
+def _diag_flush(output_dir: Path):
+    if RUN_DIAGNOSTICS is None:
+        return
+    # Convert defaultdicts to dicts for JSON.
+    by_fam = {fam: dict(vals) for fam, vals in RUN_DIAGNOSTICS["by_family"].items()}
+    payload = dict(RUN_DIAGNOSTICS)
+    payload["by_family"] = by_fam
+    _atomic_write_json(output_dir / "run_diagnostics.json", payload)
+
+
+def _dir_nonempty(p: Path) -> bool:
+    return p.exists() and p.is_dir() and any(p.iterdir())
+
+
+def _run_fingerprint_from_args(args) -> dict:
+    """Subset of run_config used to detect incompatible output reuse. (Fix G)"""
+    return {
+        "script": SCRIPT_NAME,
+        "version": VERSION,
+        "model_path": args.model_path,
+        "data_path": args.data_path,
+        "alpha": float(args.alpha),
+        "token_set": args.token_set,
+        "relevance_token_set": args.relevance_token_set,
+        "target_layers": args.target_layers or "__ALL__",
+        "max_pairs": int(args.max_pairs),
+        "max_pairs_directions": int(args.max_pairs_directions),
+        "dtype": args.dtype,
+    }
+
+
+def _prepare_output_dir(out: Path, args):
+    """Prevent mixing incompatible partial outputs unless explicitly overwritten. (Fix G)"""
+    if getattr(args, "overwrite_output_dir", False):
+        if out.exists():
+            shutil.rmtree(out)
+        out.mkdir(parents=True, exist_ok=True)
+        return
+
+    if not _dir_nonempty(out):
+        out.mkdir(parents=True, exist_ok=True)
+        return
+
+    prior = out / "run_config.json"
+    if not prior.exists():
+        raise RuntimeError(
+            f"output_dir {out} exists and is non-empty but has no run_config.json.\n"
+            "Refusing to mix outputs. Use a fresh --output_dir or pass --overwrite_output_dir."
+        )
+
+    with open(prior) as f:
+        cfg = json.load(f)
+
+    want = _run_fingerprint_from_args(args)
+    have = {k: cfg.get(k) for k in want.keys()}
+    mism = {k: {"have": have[k], "want": want[k]} for k in want.keys() if have.get(k) != want.get(k)}
+    if mism:
+        raise RuntimeError(
+            "output_dir is non-empty and appears incompatible with this run.\n"
+            f"  output_dir={out}\n"
+            f"  mismatches={json.dumps(mism, indent=2)}\n"
+            "Use a fresh --output_dir or pass --overwrite_output_dir."
+        )
 
 
 # ===================================================================
@@ -315,19 +429,21 @@ def joint_decompose(delta_h: np.ndarray, directions: list[np.ndarray]
 # Token-set pooling (canonical helper — Directive A)
 # ===================================================================
 
-def tokenize_prompt(tok, prompt: str) -> tuple[list[int], dict]:
-    """Canonical tokenization — must be used for ALL span/position logic.
+def tokenize_prompt(tok, prompt: str, device: str | None = None) -> tuple[list[int], dict, int]:
+    """Canonical tokenization — must be used for ALL forward/span/position logic.
 
     Uses the same tokenizer call path as the model forward pass
     (``tok(prompt, ...)`` not ``tok.encode(...)``), so that token ids,
     special-token handling, and truncation are identical.  This prevents
     misaligned span indices.  (Issue 2)
 
-    Returns (token_id_list, tokenizer_encoding_dict).
+    Returns (token_id_list, tokenizer_encoding_dict, seq_len).
     """
     enc = tok(prompt, return_tensors="pt", truncation=True, max_length=2048)
     ids = enc["input_ids"][0].tolist()
-    return ids, enc
+    if device is not None:
+        enc = {k: v.to(device) for k, v in enc.items()}
+    return ids, enc, len(ids)
 
 
 def make_control_token_positions(
@@ -368,8 +484,16 @@ def resolve_relevance_token_set(token_set: str,
 
 
 def find_edited_span(orig_ids: list[int], cf_ids: list[int]
-                     ) -> tuple[int, int, int, bool]:
-    """Returns (edit_start, edit_end_orig, edit_end_cf, is_fallback)."""
+                     ) -> tuple[int, int, int, bool, str]:
+    """Return edit span geometry via prefix/suffix matching.
+
+    Returns (edit_start, edit_end_orig, edit_end_cf, is_valid, reason).
+
+    Contract (Fix E):
+    - If *no* true edited region exists after prefix/suffix matching, returns
+      is_valid=False. Callers must explicitly skip/count invalid spans.
+    - edit_end_* are exclusive indices; suffix begins at edit_end. (Fix E)
+    """
     n_o, n_c = len(orig_ids), len(cf_ids)
     prefix = 0
     for i in range(min(n_o, n_c)):
@@ -388,8 +512,8 @@ def find_edited_span(orig_ids: list[int], cf_ids: list[int]
     eeo = n_o - suffix
     eec = n_c - suffix
     if es >= eeo or es >= eec:
-        return 0, n_o, n_c, True
-    return es, eeo, eec, False
+        return es, eeo, eec, False, "no_true_edited_region"
+    return es, eeo, eec, True, "ok"
 
 
 def pool_hidden(hidden: torch.Tensor, token_set: str,
@@ -423,27 +547,28 @@ def pool_hidden(hidden: torch.Tensor, token_set: str,
 
 def make_token_positions(n_tokens: int, token_set: str,
                          edit_start: int, edit_end: int
-                         ) -> tuple[list[int] | None, bool]:
+                         ) -> tuple[list[int] | None, bool, str]:
     """Return (positions, is_valid) for hook intervention.
 
     Returns None for positions when token_set == 'all' (hooks should
     apply to all positions).
     """
     if token_set == "all":
-        return None, True
+        return None, True, "all_tokens"
     if token_set == "final_token":
-        return [n_tokens - 1], True
+        return [n_tokens - 1], True, "final_token"
     if token_set == "edited_span":
         s = max(0, min(edit_start, n_tokens))
         e = max(s, min(edit_end, n_tokens))
         if e <= s:
-            return [], False
-        return list(range(s, e)), True
+            return [], False, "empty_edited_span"
+        return list(range(s, e)), True, "edited_span"
     if token_set == "suffix":
+        # Convention: suffix begins at edit_end (exclusive end of edit span). (Fix E)
         s = max(0, min(edit_end, n_tokens))
         if s >= n_tokens:
-            return [], False
-        return list(range(s, n_tokens)), True
+            return [], False, "empty_suffix"
+        return list(range(s, n_tokens)), True, "suffix"
     raise ValueError(f"Unknown token_set: {token_set!r}")
 
 
@@ -690,9 +815,12 @@ def get_answer_token_ids(tok) -> dict:
     ids = {}
     for letter in "ABCD":
         for s in [letter, f" {letter}"]:
-            toks = tok.encode(s, add_special_tokens=False)
+            # Use the canonical tokenizer call path (not tok.encode) to avoid
+            # subtle inconsistencies with special tokens / fast tokenizers. (Fix C)
+            enc = tok(s, add_special_tokens=False, return_tensors=None)
+            toks = enc.get("input_ids", [])
             if toks and letter in tok.decode([toks[-1]]).strip():
-                ids[letter] = toks[-1]
+                ids[letter] = int(toks[-1])
                 break
         if letter not in ids:
             raise ValueError(f"Cannot resolve token id for '{letter}'")
@@ -707,6 +835,12 @@ def get_answer_token_ids(tok) -> dict:
 # Forward pass utilities
 # ===================================================================
 
+def _tokenize_for_forward(tok, prompt: str, device: str) -> tuple[dict, list[int], int]:
+    """Canonical tokenization for forward passes and position validation. (Fix C)"""
+    ids, enc, n = tokenize_prompt(tok, prompt, device=device)
+    return enc, ids, n
+
+
 @torch.no_grad()
 def get_logits_and_hidden(model, tok, prompt: str, device: str,
                           answer_ids: dict,
@@ -717,10 +851,7 @@ def get_logits_and_hidden(model, tok, prompt: str, device: str,
     Hidden states are indexed by transformer block (0..N-1).
     ``hidden[k]`` = output of block k, shape ``(1, seq_len, d)``.
     """
-    inputs = tok(prompt, return_tensors="pt", truncation=True,
-                 max_length=2048)
-    inputs = {k: v.to(device) for k, v in inputs.items()}
-    n_tokens = inputs["input_ids"].shape[1]
+    inputs, _, n_tokens = _tokenize_for_forward(tok, prompt, device)
 
     out = model(**inputs, output_hidden_states=True, use_cache=False)
     final_logits = out.logits[0, -1, :]
@@ -743,9 +874,7 @@ def get_logits_and_hidden(model, tok, prompt: str, device: str,
 @torch.no_grad()
 def get_logits_only(model, tok, prompt: str, device: str,
                     answer_ids: dict) -> np.ndarray:
-    inputs = tok(prompt, return_tensors="pt", truncation=True,
-                 max_length=2048)
-    inputs = {k: v.to(device) for k, v in inputs.items()}
+    inputs, _, _ = _tokenize_for_forward(tok, prompt, device)
     out = model(**inputs, output_hidden_states=False, use_cache=False)
     fl = out.logits[0, -1, :]
     return np.array([fl[answer_ids[c]].float().cpu().item()
@@ -761,6 +890,130 @@ def _get_block(model, block_idx: int):
     return model.model.layers[block_idx]
 
 
+def _describe_hook_output(output) -> str:
+    """Human-readable description of a module forward output structure.
+
+    This is used for *loud* failures when hook output assumptions are violated.
+    (Fix A)
+    """
+    if torch.is_tensor(output):
+        return f"Tensor(shape={tuple(output.shape)}, dtype={output.dtype})"
+    if isinstance(output, (tuple, list)):
+        parts = []
+        for i, x in enumerate(output):
+            if torch.is_tensor(x):
+                parts.append(f"[{i}]=Tensor(shape={tuple(x.shape)}, dtype={x.dtype})")
+            else:
+                parts.append(f"[{i}]={type(x).__name__}")
+        return f"{type(output).__name__}(" + ", ".join(parts) + ")"
+    return f"{type(output).__name__}"
+
+
+def _extract_hidden_from_layer_output(
+    module,
+    block_idx: int,
+    output,
+    *,
+    family: str | None = None,
+    qid: str | None = None,
+    experiment: str | None = None,
+    token_set: str | None = None,
+) -> torch.Tensor:
+    """Extract hidden state tensor from a layer forward output.
+
+    Supported:
+    - output is a Tensor
+    - output is a tuple/list whose first element is a Tensor
+
+    Otherwise raises RuntimeError with rich diagnostics. (Fix A)
+    """
+    if torch.is_tensor(output):
+        hs = output
+    elif isinstance(output, (tuple, list)) and output and torch.is_tensor(output[0]):
+        hs = output[0]
+    else:
+        raise RuntimeError(
+            "Unexpected layer output structure in hook.\n"
+            f"  module={module.__class__.__name__}\n"
+            f"  block_idx={block_idx}\n"
+            f"  family={family}\n"
+            f"  qid={qid}\n"
+            f"  experiment={experiment}\n"
+            f"  token_set={token_set}\n"
+            f"  output={_describe_hook_output(output)}"
+        )
+    return hs
+
+
+def _validate_hidden_for_intervention(
+    hs: torch.Tensor,
+    *,
+    expected_hidden_size: int,
+    block_idx: int,
+    family: str | None,
+    qid: str | None,
+    experiment: str | None,
+    token_set: str | None,
+    positions: list[int] | None,
+    direction: torch.Tensor,
+):
+    """Fail loudly if hidden-state / direction shapes violate assumptions. (Fix A/B)"""
+    if not torch.is_tensor(hs):
+        raise RuntimeError(f"Hook hidden state is not a tensor: {type(hs)}")
+    if hs.ndim != 3:
+        raise RuntimeError(
+            "Hidden state has unexpected rank in hook.\n"
+            f"  block_idx={block_idx}\n"
+            f"  family={family}\n"
+            f"  qid={qid}\n"
+            f"  experiment={experiment}\n"
+            f"  token_set={token_set}\n"
+            f"  hs.shape={tuple(hs.shape)}"
+        )
+    if hs.shape[0] != 1:
+        raise RuntimeError(
+            "Batch size != 1 is not supported in this script.\n"
+            f"  block_idx={block_idx}\n"
+            f"  family={family}\n"
+            f"  qid={qid}\n"
+            f"  experiment={experiment}\n"
+            f"  token_set={token_set}\n"
+            f"  hs.shape={tuple(hs.shape)}"
+        )
+    if hs.shape[-1] != expected_hidden_size:
+        raise RuntimeError(
+            "Hidden size mismatch in hook.\n"
+            f"  block_idx={block_idx}\n"
+            f"  family={family}\n"
+            f"  qid={qid}\n"
+            f"  experiment={experiment}\n"
+            f"  token_set={token_set}\n"
+            f"  expected_hidden_size={expected_hidden_size}\n"
+            f"  hs.shape={tuple(hs.shape)}"
+        )
+    if direction.ndim != 1 or direction.shape[0] != expected_hidden_size:
+        raise RuntimeError(
+            "Direction shape mismatch in hook.\n"
+            f"  block_idx={block_idx}\n"
+            f"  family={family}\n"
+            f"  qid={qid}\n"
+            f"  experiment={experiment}\n"
+            f"  token_set={token_set}\n"
+            f"  direction.shape={tuple(direction.shape)}\n"
+            f"  expected_hidden_size={expected_hidden_size}"
+        )
+    if positions is not None:
+        if not positions:
+            raise RuntimeError(
+                "positions=[] reached hook; this should have been rejected earlier.\n"
+                f"  block_idx={block_idx}\n"
+                f"  family={family}\n"
+                f"  qid={qid}\n"
+                f"  experiment={experiment}\n"
+                f"  token_set={token_set}"
+            )
+
+
 class ResidualAddHook:
     """Add α·direction to the post-block hidden state at given positions.
 
@@ -768,23 +1021,50 @@ class ResidualAddHook:
     """
 
     def __init__(self, direction: torch.Tensor, alpha: float,
-                 positions: list[int] | None = None):
+                 positions: list[int] | None = None,
+                 *,
+                 expected_hidden_size: int,
+                 block_idx: int,
+                 token_set: str,
+                 family: str | None = None,
+                 qid: str | None = None,
+                 experiment: str | None = None):
         self.direction = direction.clone()
         self.alpha = alpha
         self.positions = positions
+        self.expected_hidden_size = expected_hidden_size
+        self.block_idx = block_idx
+        self.token_set = token_set
+        self.family = family
+        self.qid = qid
+        self.experiment = experiment
         self.handle = None
 
     def hook_fn(self, module, args, output):
-        hs = output[0] if isinstance(output, (tuple, list)) else output
+        hs = _extract_hidden_from_layer_output(
+            module, self.block_idx, output,
+            family=self.family, qid=self.qid, experiment=self.experiment, token_set=self.token_set
+        )
+        _validate_hidden_for_intervention(
+            hs,
+            expected_hidden_size=self.expected_hidden_size,
+            block_idx=self.block_idx,
+            family=self.family,
+            qid=self.qid,
+            experiment=self.experiment,
+            token_set=self.token_set,
+            positions=self.positions,
+            direction=self.direction,
+        )
         new_hs = hs.clone()
         d = self.direction.to(device=new_hs.device, dtype=new_hs.dtype)
         delta = self.alpha * d
         if self.positions is None:
             new_hs[0] = new_hs[0] + delta.unsqueeze(0)
         else:
-            for pos in self.positions:
-                if 0 <= pos < new_hs.shape[1]:
-                    new_hs[0, pos] = new_hs[0, pos] + delta
+            # Vectorized update for selected positions. (Fix B)
+            idx = torch.tensor(self.positions, device=new_hs.device, dtype=torch.long)
+            new_hs[0, idx, :] = new_hs[0, idx, :] + delta.unsqueeze(0)
         if isinstance(output, (tuple, list)):
             return (new_hs,) + tuple(output[1:])
         return new_hs
@@ -806,23 +1086,51 @@ class DirectionalAblationHook:
     """
 
     def __init__(self, direction: torch.Tensor,
-                 positions: list[int] | None = None):
+                 positions: list[int] | None = None,
+                 *,
+                 expected_hidden_size: int,
+                 block_idx: int,
+                 token_set: str,
+                 family: str | None = None,
+                 qid: str | None = None,
+                 experiment: str | None = None):
         self.direction = direction.clone()
         self.positions = positions
+        self.expected_hidden_size = expected_hidden_size
+        self.block_idx = block_idx
+        self.token_set = token_set
+        self.family = family
+        self.qid = qid
+        self.experiment = experiment
         self.handle = None
 
     def hook_fn(self, module, args, output):
-        hs = output[0] if isinstance(output, (tuple, list)) else output
+        hs = _extract_hidden_from_layer_output(
+            module, self.block_idx, output,
+            family=self.family, qid=self.qid, experiment=self.experiment, token_set=self.token_set
+        )
+        _validate_hidden_for_intervention(
+            hs,
+            expected_hidden_size=self.expected_hidden_size,
+            block_idx=self.block_idx,
+            family=self.family,
+            qid=self.qid,
+            experiment=self.experiment,
+            token_set=self.token_set,
+            positions=self.positions,
+            direction=self.direction,
+        )
         new_hs = hs.clone()
         d = self.direction.to(device=new_hs.device, dtype=new_hs.dtype)
         if self.positions is None:
             proj = torch.einsum("bsd,d->bs", new_hs, d)
             new_hs = new_hs - proj.unsqueeze(-1) * d
         else:
-            for pos in self.positions:
-                if 0 <= pos < new_hs.shape[1]:
-                    proj = torch.dot(new_hs[0, pos], d)
-                    new_hs[0, pos] = new_hs[0, pos] - proj * d
+            # Vectorized projection removal at selected positions. (Fix B)
+            idx = torch.tensor(self.positions, device=new_hs.device, dtype=torch.long)
+            sel = new_hs[0, idx, :]  # (k, d)
+            proj = sel @ d  # (k,)
+            new_hs[0, idx, :] = sel - proj.unsqueeze(-1) * d.unsqueeze(0)
         if isinstance(output, (tuple, list)):
             return (new_hs,) + tuple(output[1:])
         return new_hs
@@ -837,6 +1145,84 @@ class DirectionalAblationHook:
             self.handle = None
 
 
+def validate_intervention_request(
+    *,
+    prompt: str,
+    block_idx: int,
+    n_layers: int,
+    direction: torch.Tensor,
+    positions: list[int] | None,
+    expected_hidden_size: int,
+    token_set: str,
+    family: str | None = None,
+    qid: str | None = None,
+    experiment: str | None = None,
+    seq_len: int,
+):
+    """Fail fast before hook registration when assumptions are violated. (Fix D/B)"""
+    if not (0 <= block_idx < n_layers):
+        raise RuntimeError(
+            "Invalid block_idx for intervention.\n"
+            f"  family={family}\n"
+            f"  qid={qid}\n"
+            f"  experiment={experiment}\n"
+            f"  token_set={token_set}\n"
+            f"  block_idx={block_idx}\n"
+            f"  n_layers={n_layers}"
+        )
+    if direction.ndim != 1 or direction.shape[0] != expected_hidden_size:
+        raise RuntimeError(
+            "Invalid direction shape for intervention.\n"
+            f"  family={family}\n"
+            f"  qid={qid}\n"
+            f"  experiment={experiment}\n"
+            f"  token_set={token_set}\n"
+            f"  block_idx={block_idx}\n"
+            f"  direction.shape={tuple(direction.shape)}\n"
+            f"  expected_hidden_size={expected_hidden_size}"
+        )
+    if positions is None:
+        return
+    if not isinstance(positions, list):
+        raise RuntimeError(f"positions must be list[int] or None, got {type(positions)}")
+    if not positions:
+        raise RuntimeError(
+            "positions=[] for intervention (invalid/empty token slice).\n"
+            f"  family={family}\n"
+            f"  qid={qid}\n"
+            f"  experiment={experiment}\n"
+            f"  token_set={token_set}\n"
+            f"  block_idx={block_idx}\n"
+            f"  seq_len={seq_len}"
+        )
+    if any((not isinstance(p, int)) for p in positions):
+        bad = [p for p in positions if not isinstance(p, int)]
+        raise RuntimeError(
+            "Non-int positions for intervention.\n"
+            f"  family={family}\n"
+            f"  qid={qid}\n"
+            f"  experiment={experiment}\n"
+            f"  token_set={token_set}\n"
+            f"  block_idx={block_idx}\n"
+            f"  seq_len={seq_len}\n"
+            f"  bad_positions={bad[:5]}"
+        )
+    mn, mx = min(positions), max(positions)
+    if mn < 0 or mx >= seq_len:
+        raise RuntimeError(
+            "Out-of-range token positions for intervention.\n"
+            f"  family={family}\n"
+            f"  qid={qid}\n"
+            f"  experiment={experiment}\n"
+            f"  token_set={token_set}\n"
+            f"  block_idx={block_idx}\n"
+            f"  seq_len={seq_len}\n"
+            f"  positions_min={mn}\n"
+            f"  positions_max={mx}\n"
+            f"  n_positions={len(positions)}"
+        )
+
+
 @torch.no_grad()
 def forward_with_hook(model, tok, prompt: str, device: str,
                       answer_ids: dict, hook_obj,
@@ -844,17 +1230,71 @@ def forward_with_hook(model, tok, prompt: str, device: str,
                       return_hidden: bool = False,
                       hidden_layers: list[int] | None = None
                       ) -> tuple[np.ndarray, dict | None]:
-    """Forward pass with a registered hook (always cleaned up)."""
+    """Forward pass with a registered hook (always cleaned up).
+
+    Uses one canonical tokenization path for:
+      - computing seq_len for validation
+      - the actual model forward pass
+    This prevents span/position drift. (Fix C/D)
+    """
+    family = getattr(hook_obj, "family", None)
+    qid = getattr(hook_obj, "qid", None)
+    experiment = getattr(hook_obj, "experiment", None)
+    token_set = getattr(hook_obj, "token_set", "unknown")
+
+    try:
+        inputs, _, seq_len = _tokenize_for_forward(tok, prompt, device)
+
+        # Pre-hook validation (Fix D/B)
+        validate_intervention_request(
+            prompt=prompt,
+            block_idx=block_idx,
+            n_layers=model.config.num_hidden_layers,
+            direction=hook_obj.direction,
+            positions=hook_obj.positions,
+            expected_hidden_size=hook_obj.expected_hidden_size,
+            token_set=token_set,
+            family=family,
+            qid=qid,
+            experiment=experiment,
+            seq_len=seq_len,
+        )
+    except Exception as e:
+        _diag_inc(family, "validation_errors")
+        raise
+
     hook_obj.register(model, block_idx)
     try:
-        if return_hidden:
-            logits, hidden, _ = get_logits_and_hidden(
-                model, tok, prompt, device, answer_ids,
-                layers=hidden_layers)
-            return logits, hidden
-        else:
-            return get_logits_only(model, tok, prompt, device,
-                                   answer_ids), None
+        out = model(**inputs, output_hidden_states=return_hidden, use_cache=False)
+        fl = out.logits[0, -1, :]
+        logits_abcd = np.array([fl[answer_ids[c]].float().cpu().item()
+                                for c in "ABCD"], dtype=np.float32)
+
+        if not return_hidden:
+            return logits_abcd, None
+
+        all_hs = out.hidden_states
+        n_blocks = len(all_hs) - 1
+        target = hidden_layers if hidden_layers is not None else list(range(n_blocks))
+        hidden = {}
+        for bi in target:
+            if 0 <= bi < n_blocks:
+                hidden[bi] = all_hs[bi + 1].detach().cpu()
+        return logits_abcd, hidden
+    except Exception as e:
+        msg = str(e)
+        if "Out-of-range token positions" in msg:
+            _diag_inc(family, "out_of_range_position_errors")
+        if "Unexpected layer output structure in hook" in msg or \
+           "Hidden state has unexpected rank in hook" in msg or \
+           "Hidden size mismatch in hook" in msg:
+            _diag_inc(family, "hook_shape_errors")
+        _diag_set("last_error", {
+            "family": family, "qid": qid, "experiment": experiment,
+            "token_set": token_set, "block_idx": block_idx,
+            "error_type": type(e).__name__, "message": msg[:2000],
+        })
+        raise
     finally:
         hook_obj.remove()
 
@@ -866,7 +1306,15 @@ def validate_hook_identity(model, tok, device: str, answer_ids: dict,
     """Verify that a zero-alpha hook produces identical logits."""
     base = get_logits_only(model, tok, prompt, device, answer_ids)
     zero_dir = torch.zeros(hidden_size)
-    hook = ResidualAddHook(zero_dir, 0.0)
+    hook = ResidualAddHook(
+        zero_dir, 0.0, None,
+        expected_hidden_size=hidden_size,
+        block_idx=block_idx,
+        token_set="all",
+        family=None,
+        qid=None,
+        experiment="sanity_hook_identity",
+    )
     hooked, _ = forward_with_hook(model, tok, prompt, device, answer_ids,
                                    hook, block_idx)
     diff = float(np.max(np.abs(base - hooked)))
@@ -976,10 +1424,19 @@ def compute_directions(
 
             qid = pair["qid"]
 
-            # Canonical tokenization for span detection (Issue 2).
-            orig_ids, _ = tokenize_prompt(tok, pair["orig_prompt"])
-            cf_ids, _ = tokenize_prompt(tok, pair["cf_prompt"])
-            es, eeo, eec, fallback = find_edited_span(orig_ids, cf_ids)
+            # Canonical tokenization for span detection (Issue 2 / Fix C).
+            # Only compute edit spans when the chosen token_set is span-dependent.
+            if span_dep:
+                orig_ids, _, _ = tokenize_prompt(tok, pair["orig_prompt"])
+                cf_ids, _, _ = tokenize_prompt(tok, pair["cf_prompt"])
+                es, eeo, eec, span_valid, span_reason = find_edited_span(orig_ids, cf_ids)
+                if not span_valid:
+                    # Fix E: do not silently fall back to a bogus span.
+                    n_invalid_pool += 1
+                    _diag_inc(family, "invalid_span_skips_directions")
+                    continue
+            else:
+                es = eeo = eec = 0
 
             # Issue 6: choose cache key based on whether pooling is
             # span-dependent.
@@ -1005,6 +1462,7 @@ def compute_directions(
                 del o_hidden
                 if skip:
                     n_invalid_pool += 1
+                    _diag_inc(family, "invalid_pool_skips_directions")
                     continue
                 orig_cache[cache_key] = o_pooled
 
@@ -1025,6 +1483,7 @@ def compute_directions(
             del c_hidden
             if skip:
                 n_invalid_pool += 1
+                _diag_inc(family, "invalid_pool_skips_directions")
                 continue
 
             n_irr += 1
@@ -1331,14 +1790,26 @@ def select_best_layers(
                 g = p["gold_idx"]
                 M0 = compute_margin(orig_logits_cache[i], g)
                 # Canonical tokenization for span detection (Issue 2).
-                o_ids, _ = tokenize_prompt(tok, p["orig_prompt"])
-                c_ids, _ = tokenize_prompt(tok, p["cf_prompt"])
-                es, eeo, eec, _ = find_edited_span(o_ids, c_ids)
-                pos, valid = make_token_positions(len(o_ids), token_set,
-                                                  es, eeo)
+                o_ids, _, _ = tokenize_prompt(tok, p["orig_prompt"])
+                c_ids, _, _ = tokenize_prompt(tok, p["cf_prompt"])
+                if _token_set_is_span_dependent(token_set):
+                    es, eeo, eec, span_valid, _ = find_edited_span(o_ids, c_ids)
+                    if not span_valid:
+                        continue
+                else:
+                    es = eeo = 0
+                pos, valid, _ = make_token_positions(len(o_ids), token_set, es, eeo)
                 if not valid:
                     continue
-                hook = ResidualAddHook(r_t, alpha, pos)
+                hook = ResidualAddHook(
+                    r_t, alpha, pos,
+                    expected_hidden_size=hidden_size,
+                    block_idx=bi,
+                    token_set=token_set,
+                    family=family,
+                    qid=str(p.get("qid")),
+                    experiment="layer_selection_add_irr",
+                )
                 al, _ = forward_with_hook(model, tok, p["orig_prompt"],
                                           device, answer_ids, hook, bi)
                 dm_add.append(abs(compute_margin(al, g) - M0))
@@ -1353,14 +1824,26 @@ def select_best_layers(
                     rf_vals.append(0.0)
                     continue
                 # Canonical tokenization (Issue 2).
-                o_ids, _ = tokenize_prompt(tok, p["orig_prompt"])
-                c_ids, _ = tokenize_prompt(tok, p["cf_prompt"])
-                es, eeo, eec, _ = find_edited_span(o_ids, c_ids)
-                pos, valid = make_token_positions(len(c_ids), token_set,
-                                                  es, eec)
+                o_ids, _, _ = tokenize_prompt(tok, p["orig_prompt"])
+                c_ids, _, _ = tokenize_prompt(tok, p["cf_prompt"])
+                if _token_set_is_span_dependent(token_set):
+                    es, eeo, eec, span_valid, _ = find_edited_span(o_ids, c_ids)
+                    if not span_valid:
+                        continue
+                else:
+                    es = eec = 0
+                pos, valid, _ = make_token_positions(len(c_ids), token_set, es, eec)
                 if not valid:
                     continue
-                hook = DirectionalAblationHook(r_t, pos)
+                hook = DirectionalAblationHook(
+                    r_t, pos,
+                    expected_hidden_size=hidden_size,
+                    block_idx=bi,
+                    token_set=token_set,
+                    family=family,
+                    qid=str(p.get("qid")),
+                    experiment="layer_selection_abl_irr",
+                )
                 al, _ = forward_with_hook(model, tok, p["cf_prompt"],
                                           device, answer_ids, hook, bi)
                 M_abl = compute_margin(al, g)
@@ -1373,10 +1856,18 @@ def select_best_layers(
             for i, p in enumerate(ctrl_sub):
                 g = p["gold_idx"]
                 M0 = compute_margin(ctrl_logits_cache[i], g)
-                c_ids_ctrl, _ = tokenize_prompt(tok, p["cf_prompt"])
+                c_ids_ctrl, _, _ = tokenize_prompt(tok, p["cf_prompt"])
                 ctrl_pos, _, _ = make_control_token_positions(
                     len(c_ids_ctrl), token_set)
-                hook = ResidualAddHook(r_t, alpha, ctrl_pos)
+                hook = ResidualAddHook(
+                    r_t, alpha, ctrl_pos,
+                    expected_hidden_size=hidden_size,
+                    block_idx=bi,
+                    token_set=token_set,
+                    family=family,
+                    qid=str(p.get("qid")),
+                    experiment="layer_selection_ctrl_add",
+                )
                 al, _ = forward_with_hook(model, tok, p["cf_prompt"],
                                           device, answer_ids, hook, bi)
                 dm_ctrl.append(abs(compute_margin(al, g) - M0))
@@ -1443,26 +1934,38 @@ def select_best_layers(
 # ===================================================================
 
 def _pair_span_info(tok, pair: dict, token_set: str, prompt_key: str
-                    ) -> tuple[int, int, int, list[int] | None, bool]:
-    """Return (edit_start, edit_end_for_prompt, n_tokens, positions, valid).
+                    ) -> tuple[int, int, int, list[int] | None, bool, str, str]:
+    """Return span geometry + hook positions for a focal (orig, cf) pair.
 
     ``prompt_key`` should be 'orig_prompt' or 'cf_prompt'.
 
     Uses ``tokenize_prompt()`` (canonical tokenizer path) so that span
     indices are guaranteed to align with model forward-pass tokenization.
     (Issue 2)
+
+    Returns:
+      (edit_start, edit_end_for_prompt, n_tokens, positions, is_valid,
+       reason, position_policy)
     """
-    o_ids, _ = tokenize_prompt(tok, pair["orig_prompt"])
-    c_ids, _ = tokenize_prompt(tok, pair["cf_prompt"])
-    es, eeo, eec, _ = find_edited_span(o_ids, c_ids)
+    o_ids, _, _ = tokenize_prompt(tok, pair["orig_prompt"])
+    c_ids, _, _ = tokenize_prompt(tok, pair["cf_prompt"])
+    if _token_set_is_span_dependent(token_set):
+        es, eeo, eec, span_valid, span_reason = find_edited_span(o_ids, c_ids)
+        if not span_valid:
+            if prompt_key == "orig_prompt":
+                return es, eeo, len(o_ids), [], False, span_reason, "invalid_span"
+            return es, eec, len(c_ids), [], False, span_reason, "invalid_span"
+    else:
+        es = eeo = eec = 0
     if prompt_key == "orig_prompt":
         n_tok = len(o_ids)
         ee = eeo
     else:
         n_tok = len(c_ids)
         ee = eec
-    pos, valid = make_token_positions(n_tok, token_set, es, ee)
-    return es, ee, n_tok, pos, valid
+    pos, valid, pos_reason = make_token_positions(n_tok, token_set, es, ee)
+    policy = _focal_position_policy(token_set) if valid else f"invalid_{pos_reason}"
+    return es, ee, n_tok, pos, valid, pos_reason, policy
 
 
 def _pool_at_layer(hidden: dict, layer: int, token_set: str,
@@ -1507,13 +2010,18 @@ def run_exp1_add_irr(
                 print(f"  [{pi+1}/{len(subset)}]")
             g = pair["gold_idx"]
 
-            es, ee_o, n_o, pos, valid = _pair_span_info(
+            es, ee_o, n_o, pos, valid, reason, pos_policy = _pair_span_info(
                 tok, pair, token_set, "orig_prompt")
             if not valid:
                 n_skip += 1
+                _diag_inc(family, "invalid_span_or_positions_skips_exp1")
                 continue
-            _, ee_c, _, _, _ = _pair_span_info(
+            _, ee_c, _, _, valid_c, _, _ = _pair_span_info(
                 tok, pair, token_set, "cf_prompt")
+            if not valid_c:
+                n_skip += 1
+                _diag_inc(family, "invalid_span_or_positions_skips_exp1")
+                continue
 
             orig_L, orig_H, _ = get_logits_and_hidden(
                 model, tok, pair["orig_prompt"], device, answer_ids,
@@ -1522,7 +2030,15 @@ def run_exp1_add_irr(
                 model, tok, pair["cf_prompt"], device, answer_ids,
                 layers=[bi])
 
-            hook = ResidualAddHook(r_t, alpha, pos)
+            hook = ResidualAddHook(
+                r_t, alpha, pos,
+                expected_hidden_size=int(r_t.numel()),
+                block_idx=bi,
+                token_set=token_set,
+                family=family,
+                qid=str(pair.get("qid")),
+                experiment="exp1_add_irr",
+            )
             add_L, add_H = forward_with_hook(
                 model, tok, pair["orig_prompt"], device, answer_ids,
                 hook, bi, return_hidden=True, hidden_layers=[bi])
@@ -1542,9 +2058,6 @@ def run_exp1_add_irr(
             M_o = compute_margin(orig_L, g)
             M_a = compute_margin(add_L, g)
             M_c = compute_margin(cf_L, g)
-
-            # FIX 5: standardized position policy label.
-            pos_policy = _focal_position_policy(token_set)
 
             row = {
                 "qid": pair["qid"], "family": family,
@@ -1596,6 +2109,11 @@ def run_exp1_add_irr(
             "sim_orig_add_primary",
         ], ratio_keys=["EF_add_logit", "EF_add_margin"],
             count_keys=["orig_correct", "cf_correct", "add_correct"])
+        # Fix F: distinguish span/position invalidity from pooling failures.
+        agg["n_skipped_invalid_span_or_positions"] = n_skip
+        # Backward-compat key (kept to avoid breaking downstream readers).
+        agg["n_skipped_invalid_span_or_positions"] = n_skip
+        # Backward-compat key.
         agg["n_skipped_invalid_pool"] = n_skip
         with open(exp_dir / "aggregate.json", "w") as f:
             json.dump(agg, f, indent=2)
@@ -1606,8 +2124,12 @@ def run_exp1_add_irr(
             description="Activation addition of r̂_a on irrelevant "
                         "original prompts",
             family=family, **_layer_output_row(bi),
-            token_set=token_set, alpha=alpha,
+            token_set_requested=token_set,
+            token_set_applied=token_set,
+            alpha=alpha,
             n_used_pairs=len(rows),
+            n_skipped_invalid_span_or_positions=n_skip,
+            # Backward-compat key.
             n_skipped_invalid_pool=n_skip,
             intervention_position_policy=_focal_position_policy(token_set),
             interpretation="Measures how much adding the attribute "
@@ -1653,13 +2175,18 @@ def run_exp2_abl_irr(
                 print(f"  [{pi+1}/{len(subset)}]")
             g = pair["gold_idx"]
 
-            es, ee_c, n_c, pos, valid = _pair_span_info(
+            es, ee_c, n_c, pos, valid, reason, pos_policy = _pair_span_info(
                 tok, pair, token_set, "cf_prompt")
             if not valid:
                 n_skip += 1
+                _diag_inc(family, "invalid_span_or_positions_skips_exp2")
                 continue
-            _, ee_o, _, _, _ = _pair_span_info(
+            _, ee_o, _, _, valid_o, _, _ = _pair_span_info(
                 tok, pair, token_set, "orig_prompt")
+            if not valid_o:
+                n_skip += 1
+                _diag_inc(family, "invalid_span_or_positions_skips_exp2")
+                continue
 
             orig_L, orig_H, _ = get_logits_and_hidden(
                 model, tok, pair["orig_prompt"], device, answer_ids,
@@ -1668,7 +2195,15 @@ def run_exp2_abl_irr(
                 model, tok, pair["cf_prompt"], device, answer_ids,
                 layers=[bi])
 
-            hook = DirectionalAblationHook(r_t, pos)
+            hook = DirectionalAblationHook(
+                r_t, pos,
+                expected_hidden_size=int(r_t.numel()),
+                block_idx=bi,
+                token_set=token_set,
+                family=family,
+                qid=str(pair.get("qid")),
+                experiment="exp2_abl_irr",
+            )
             abl_L, abl_H = forward_with_hook(
                 model, tok, pair["cf_prompt"], device, answer_ids,
                 hook, bi, return_hidden=True, hidden_layers=[bi])
@@ -1694,8 +2229,8 @@ def run_exp2_abl_irr(
             is_flip = orig_correct and not cf_correct
             flip_recovered = is_flip and abl_correct
 
-            # FIX 5: standardized position policy label.
-            pos_policy_2 = _focal_position_policy(token_set)
+            # FIX 5: standardized position policy label (from span/position helper).
+            pos_policy_2 = pos_policy
 
             row = {
                 "qid": pair["qid"], "family": family,
@@ -1757,8 +2292,11 @@ def run_exp2_abl_irr(
             description="Directional ablation of r̂_a from irrelevant "
                         "counterfactual prompts",
             family=family, **_layer_output_row(bi),
-            token_set=token_set,
+            token_set_requested=token_set,
+            token_set_applied=token_set,
             n_used_pairs=len(rows),
+            n_skipped_invalid_span_or_positions=n_skip,
+            # Backward-compat key.
             n_skipped_invalid_pool=n_skip,
             intervention_position_policy=_focal_position_policy(token_set),
             interpretation="Measures how much removing the attribute "
@@ -1814,16 +2352,32 @@ def run_exp3_ctrl(
 
             # Issue 3: Use explicit control position policy rather than
             # silently applying to all tokens.
-            c_ids_ctrl, _ = tokenize_prompt(tok, pair["cf_prompt"])
+            c_ids_ctrl, _, _ = tokenize_prompt(tok, pair["cf_prompt"])
             ctrl_pos, _, ctrl_policy = make_control_token_positions(
                 len(c_ids_ctrl), token_set)
 
-            hook_a = ResidualAddHook(r_t, alpha, ctrl_pos)
+            hook_a = ResidualAddHook(
+                r_t, alpha, ctrl_pos,
+                expected_hidden_size=int(r_t.numel()),
+                block_idx=bi,
+                token_set=token_set,
+                family=family,
+                qid=str(pair.get("qid")),
+                experiment="exp3_ctrl_add",
+            )
             add_L, _ = forward_with_hook(model, tok, pair["cf_prompt"],
                                          device, answer_ids, hook_a, bi)
             M_a = compute_margin(add_L, g)
 
-            hook_b = DirectionalAblationHook(r_t, ctrl_pos)
+            hook_b = DirectionalAblationHook(
+                r_t, ctrl_pos,
+                expected_hidden_size=int(r_t.numel()),
+                block_idx=bi,
+                token_set=token_set,
+                family=family,
+                qid=str(pair.get("qid")),
+                experiment="exp3_ctrl_abl",
+            )
             abl_L, _ = forward_with_hook(model, tok, pair["cf_prompt"],
                                          device, answer_ids, hook_b, bi)
             M_b = compute_margin(abl_L, g)
@@ -1918,7 +2472,15 @@ def run_exp45_relevant(
             M_r = compute_margin(rel_L, g)
 
             # Ablation uses all positions since no CF span exists.
-            hook = DirectionalAblationHook(r_t)
+            hook = DirectionalAblationHook(
+                r_t, None,
+                expected_hidden_size=int(r_t.numel()),
+                block_idx=bi,
+                token_set="all",
+                family=family,
+                qid=str(rec.get("qid")),
+                experiment="exp5_rel_abl_all_tokens",
+            )
             abl_L, _ = forward_with_hook(model, tok, rec["orig_prompt"],
                                          device, answer_ids, hook, bi)
             M_a = compute_margin(abl_L, g)
@@ -2039,7 +2601,15 @@ def run_exp6_medrel_abl(
             M_o = compute_margin(fp["_oL"], g)
             M_c = compute_margin(fp["_cL"], g)
 
-            hook = DirectionalAblationHook(m_t)
+            hook = DirectionalAblationHook(
+                m_t, None,
+                expected_hidden_size=int(m_t.numel()),
+                block_idx=bi,
+                token_set="all",
+                family=family,
+                qid=str(fp.get("qid")),
+                experiment="exp6_medrel_abl_all_tokens",
+            )
             abl_L, _ = forward_with_hook(model, tok, fp["cf_prompt"],
                                          device, answer_ids, hook, bi)
             M_a = compute_margin(abl_L, g)
@@ -2149,10 +2719,18 @@ def run_exp7_decomposition(
                 print(f"  [{pi+1}/{len(subset)}]")
 
             qid = pair["qid"]
-            # Canonical tokenization (Issue 2).
-            o_ids, _ = tokenize_prompt(tok, pair["orig_prompt"])
-            c_ids, _ = tokenize_prompt(tok, pair["cf_prompt"])
-            es, eeo, eec, _ = find_edited_span(o_ids, c_ids)
+            # Canonical tokenization (Issue 2 / Fix C).
+            if span_dep_7:
+                o_ids, _, _ = tokenize_prompt(tok, pair["orig_prompt"])
+                c_ids, _, _ = tokenize_prompt(tok, pair["cf_prompt"])
+                es, eeo, eec, span_valid, _ = find_edited_span(o_ids, c_ids)
+                if not span_valid:
+                    # Fix E: explicit skip for invalid spans.
+                    n_skip += 1
+                    _diag_inc(family, "invalid_span_skips_exp7")
+                    continue
+            else:
+                es = eeo = eec = 0
 
             # Issue 6: span-aware cache key.
             ck = (qid, es, eeo, token_set) if span_dep_7 else qid
@@ -2647,7 +3225,156 @@ def run_sanity_checks(model, tok, device: str, answer_ids: dict,
         "Span-independent cache keys should be identical for same qid"
     print("     PASS")
 
+    # 6. Token-set position generation + hook forwards for each mode.
+    # This is the targeted geometry test for final_token/all/edited_span/suffix. (Fix H)
+    print("  6. Token-set geometry + hooked forwards...")
+    ctx_o = "A 50-year-old man presents with chest pain."
+    ctx_c = "A 50-year-old woman presents with chest pain."
+    choices = {"A": "MI", "B": "PE", "C": "GERD", "D": "Pneumonia"}
+    orig_p = format_prompt(ctx_o, choices)
+    cf_p = format_prompt(ctx_c, choices)
+
+    o_ids, _, _ = tokenize_prompt(tok, orig_p)
+    c_ids, _, _ = tokenize_prompt(tok, cf_p)
+    es, eeo, eec, span_valid, span_reason = find_edited_span(o_ids, c_ids)
+    assert span_valid, f"Expected synthetic edited span to be valid: {span_reason}"
+
+    d = torch.randn(hidden_size).float()
+    d = d / (d.norm() + 1e-12)
+    bi = 0
+
+    for ts in ["final_token", "all", "edited_span", "suffix"]:
+        if _token_set_is_span_dependent(ts):
+            pos_o, v_o, _ = make_token_positions(len(o_ids), ts, es, eeo)
+            pos_c, v_c, _ = make_token_positions(len(c_ids), ts, es, eec)
+            assert v_o and v_c, f"{ts}: expected valid positions for synthetic pair"
+        else:
+            pos_o, v_o, _ = make_token_positions(len(o_ids), ts, 0, 0)
+            pos_c, v_c, _ = make_token_positions(len(c_ids), ts, 0, 0)
+            assert v_o and v_c, f"{ts}: expected valid positions"
+
+        # Addition on original prompt.
+        hk_add = ResidualAddHook(
+            d, 0.25, pos_o,
+            expected_hidden_size=hidden_size,
+            block_idx=bi,
+            token_set=ts,
+            family="__sanity__",
+            qid="__sanity__",
+            experiment=f"sanity_add_{ts}",
+        )
+        _ = forward_with_hook(model, tok, orig_p, device, answer_ids, hk_add, bi)
+
+        # Ablation on counterfactual prompt.
+        hk_abl = DirectionalAblationHook(
+            d, pos_c,
+            expected_hidden_size=hidden_size,
+            block_idx=bi,
+            token_set=ts,
+            family="__sanity__",
+            qid="__sanity__",
+            experiment=f"sanity_abl_{ts}",
+        )
+        _ = forward_with_hook(model, tok, cf_p, device, answer_ids, hk_abl, bi)
+
+    # Negative case: no meaningful edited region should be invalid for edited_span.
+    es2, eeo2, eec2, span_ok2, reason2 = find_edited_span(o_ids, o_ids)
+    assert not span_ok2, f"Expected invalid span when prompts identical, got {reason2}"
+    pos_bad, v_bad, _ = make_token_positions(len(o_ids), "edited_span", es2, eeo2)
+    assert not v_bad and pos_bad == [], "edited_span should be invalid/empty when no true edit exists"
+    print("     PASS")
+
     print("=== All sanity checks passed ===\n")
+
+
+def run_validate_only(
+    model, tok, device: str, answer_ids: dict,
+    data: dict,
+    directions: dict,
+    best_layers: dict[str, int],
+    alpha: float,
+    token_set: str,
+    rng,
+    output_dir: Path,
+):
+    """Dry-run intervention geometry on a small sample. (Fix K)
+
+    This intentionally runs only a handful of hooked forwards to catch:
+    - invalid spans / empty position sets
+    - out-of-range position requests
+    - unexpected hook output / hidden-state shapes
+    """
+    print("\n=== Validate-only: Intervention Geometry ===")
+    report = {"by_family": {}, "token_set": token_set, "alpha": alpha}
+    hidden_size = int(model.config.hidden_size)
+
+    for family in ALL_FOCAL:
+        # Geometry validation should not depend on successfully computing
+        # directions (which may require many pairs). If r̂ is unavailable,
+        # fall back to a synthetic direction of the correct shape. (Fix K)
+        bi = best_layers.get(family, 0)
+        r_t = None
+        if family in directions and directions[family].get("r_hat") is not None:
+            r_hat = directions[family]["r_hat"].get(bi)
+            if r_hat is not None and np.linalg.norm(r_hat) > 1e-10:
+                r_t = torch.from_numpy(r_hat).float()
+        if r_t is None:
+            r_t = torch.randn(hidden_size).float()
+            r_t = r_t / (r_t.norm() + 1e-12)
+
+        fam_pairs = data["pairs_irr"].get(family, [])
+        if not fam_pairs:
+            continue
+        # Try enough examples to find at least one valid span/position set.
+        subset = sample_pairs(fam_pairs, min(50, len(fam_pairs)), rng)
+
+        fam_rep = {"tested": 0, "skipped_invalid_span_or_positions": 0}
+
+        for pair in subset:
+            # Exp1-style: addition on original.
+            es, ee_o, _, pos_o, valid_o, _, _ = _pair_span_info(tok, pair, token_set, "orig_prompt")
+            if not valid_o:
+                fam_rep["skipped_invalid_span_or_positions"] += 1
+                _diag_inc(family, "validate_only_skips_invalid_span_or_positions")
+                continue
+            hk_add = ResidualAddHook(
+                r_t, alpha, pos_o,
+                expected_hidden_size=int(r_t.numel()),
+                block_idx=bi,
+                token_set=token_set,
+                family=family,
+                qid=str(pair.get("qid")),
+                experiment="validate_only_exp1_add",
+            )
+            _ = forward_with_hook(model, tok, pair["orig_prompt"], device, answer_ids, hk_add, bi)
+
+            # Exp2-style: ablation on CF.
+            _, ee_c, _, pos_c, valid_c, _, _ = _pair_span_info(tok, pair, token_set, "cf_prompt")
+            if not valid_c:
+                fam_rep["skipped_invalid_span_or_positions"] += 1
+                _diag_inc(family, "validate_only_skips_invalid_span_or_positions")
+                continue
+            hk_abl = DirectionalAblationHook(
+                r_t, pos_c,
+                expected_hidden_size=int(r_t.numel()),
+                block_idx=bi,
+                token_set=token_set,
+                family=family,
+                qid=str(pair.get("qid")),
+                experiment="validate_only_exp2_abl",
+            )
+            _ = forward_with_hook(model, tok, pair["cf_prompt"], device, answer_ids, hk_abl, bi)
+
+            fam_rep["tested"] += 1
+            if fam_rep["tested"] >= 2:
+                break
+
+        report["by_family"][family] = fam_rep
+        print(f"  {family}: tested={fam_rep['tested']}  "
+              f"skipped={fam_rep['skipped_invalid_span_or_positions']}")
+
+    _diag_set("validate_only_report", report)
+    print("=== Validate-only checks complete ===\n")
 
 
 # ===================================================================
@@ -2681,148 +3408,195 @@ def main():
     parser.add_argument("--interventions_only", action="store_true")
     parser.add_argument("--skip_plots", action="store_true")
     parser.add_argument("--sanity_checks_only", action="store_true")
+    parser.add_argument("--validate_only", action="store_true",
+                        help="Dry-run intervention geometry: sample a small "
+                             "subset per family and run 1-2 hooked forwards "
+                             "per experiment path, without running full "
+                             "experiments. (Fix K)")
+    parser.add_argument("--dry_run_interventions", action="store_true",
+                        dest="validate_only",
+                        help="Alias for --validate_only.")
+    parser.add_argument("--overwrite_output_dir", action="store_true",
+                        help="Delete and recreate output_dir at startup. "
+                             "Unsafe by default; only runs when explicitly "
+                             "requested. (Fix G)")
     args = parser.parse_args()
 
     out = Path(args.output_dir)
-    out.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(args.seed)
+
+    _prepare_output_dir(out, args)
 
     config = vars(args).copy()
     config.update(script=SCRIPT_NAME, version=VERSION,
-                  timestamp=time.strftime("%Y-%m-%dT%H:%M:%S"))
+                  timestamp=time.strftime("%Y-%m-%dT%H:%M:%S"),
+                  output_fingerprint=_run_fingerprint_from_args(args))
     with open(out / "run_config.json", "w") as f:
         json.dump(config, f, indent=2)
+    _diag_init(config)
 
     print(f"\n{'='*60}")
     print(f"  Stage 5: Directional Activation Interventions v{VERSION}")
     print(f"{'='*60}\n")
 
-    # Load data.
-    data = load_partitioned_data(args.data_path)
-    with open(out / "data_diagnostics.json", "w") as f:
-        json.dump(data["diagnostics"], f, indent=2)
+    try:
+        # Load data.
+        data = load_partitioned_data(args.data_path)
+        with open(out / "data_diagnostics.json", "w") as f:
+            json.dump(data["diagnostics"], f, indent=2)
 
-    # Load model.
-    model, tok, device, n_layers, hidden_size = load_model(
-        args.model_path, args.device, args.dtype)
-    answer_ids = get_answer_token_ids(tok)
+        # Load model.
+        model, tok, device, n_layers, hidden_size = load_model(
+            args.model_path, args.device, args.dtype)
+        answer_ids = get_answer_token_ids(tok)
 
-    # Target layers.
-    if args.target_layers:
-        target_layers = [int(x) for x in args.target_layers.split(",")]
-    else:
-        target_layers = list(range(n_layers))
-    # Validate bounds.
-    for l in target_layers:
-        assert 0 <= l < n_layers, \
-            f"Block index {l} out of range [0, {n_layers})"
+        # Target layers.
+        if args.target_layers:
+            target_layers = [int(x) for x in args.target_layers.split(",")]
+        else:
+            target_layers = list(range(n_layers))
+        # Validate bounds.
+        for l in target_layers:
+            assert 0 <= l < n_layers, \
+                f"Block index {l} out of range [0, {n_layers})"
 
-    # Sanity checks.
-    if args.sanity_checks_only:
-        run_sanity_checks(model, tok, device, answer_ids, n_layers,
-                          hidden_size, data, out)
-        return
+        # Sanity checks.
+        if args.sanity_checks_only:
+            run_sanity_checks(model, tok, device, answer_ids, n_layers,
+                              hidden_size, data, out)
+            return
 
-    # === Phase 1: Directions ===
-    if args.interventions_only:
-        print("\n--- Loading precomputed directions ---")
-        directions = load_directions(out, target_layers, hidden_size)
-    else:
+        # === Phase 1: Directions ===
+        if args.interventions_only:
+            print("\n--- Loading precomputed directions ---")
+            directions = load_directions(out, target_layers, hidden_size)
+        else:
+            print("\n" + "=" * 60)
+            print("  Phase 1: Computing Directions")
+            print("=" * 60)
+            directions = compute_directions(
+                model, tok, device, answer_ids,
+                data["pairs_irr"], data["records_rel"],
+                n_layers, hidden_size, target_layers,
+                args.max_pairs_directions, rng, out,
+                token_set=args.token_set,
+                relevance_token_set=args.relevance_token_set)
+            if not args.skip_plots:
+                plot_direction_norms(directions, target_layers, out)
+
+        # Run-level diagnostics: record direction token_set + pooling mismatch. (Fix F)
+        _diag_set(
+            "token_set_used_for_r_hat_by_family",
+            {fam: directions.get(fam, {}).get("token_set_for_attribute_direction")
+             for fam in ALL_FOCAL if fam in directions}
+        )
+        _diag_set(
+            "token_set_used_for_m_hat_by_family",
+            {fam: directions.get(fam, {}).get("token_set_for_relevance_direction")
+             for fam in ALL_FOCAL if fam in directions}
+        )
+        _diag_set(
+            "pooling_mismatch_by_family",
+            {fam: bool(directions.get(fam, {}).get("pooling_mismatch", False))
+             for fam in ALL_FOCAL if fam in directions}
+        )
+
+        if args.directions_only:
+            print("\nDirection computation complete (--directions_only).")
+            return
+
+        # Hook identity validation (spot check).
+        prompt0 = data["all_pairs"][0]["orig_prompt"] if data["all_pairs"] else "test"
+        validate_hook_identity(model, tok, device, answer_ids, prompt0,
+                               0, hidden_size)
+
+        # === Phase 2: Layer selection ===
         print("\n" + "=" * 60)
-        print("  Phase 1: Computing Directions")
+        print("  Phase 2: Layer Selection")
         print("=" * 60)
-        directions = compute_directions(
+        best_layers = select_best_layers(
             model, tok, device, answer_ids,
-            data["pairs_irr"], data["records_rel"],
-            n_layers, hidden_size, target_layers,
-            args.max_pairs_directions, rng, out,
-            token_set=args.token_set,
-            relevance_token_set=args.relevance_token_set)
+            data["pairs_irr"], data["pairs_ctrl"],
+            directions, target_layers,
+            args.max_pairs, args.alpha, args.token_set, rng, out)
         if not args.skip_plots:
-            plot_direction_norms(directions, target_layers, out)
+            plot_site_selection(out)
 
-    if args.directions_only:
-        print("\nDirection computation complete (--directions_only).")
-        return
+        if args.validate_only:
+            run_validate_only(
+                model, tok, device, answer_ids,
+                data, directions, best_layers,
+                args.alpha, args.token_set, rng, out
+            )
+            print("\nValidation-only run complete (--validate_only).")
+            return
 
-    # Hook identity validation (spot check).
-    prompt0 = data["all_pairs"][0]["orig_prompt"] if data["all_pairs"] \
-        else "test"
-    validate_hook_identity(model, tok, device, answer_ids, prompt0,
-                            0, hidden_size)
+        # === Phase 3: Experiments ===
+        print("\n" + "=" * 60)
+        print("  Phase 3: Running Experiments")
+        print("=" * 60)
 
-    # === Phase 2: Layer selection ===
-    print("\n" + "=" * 60)
-    print("  Phase 2: Layer Selection")
-    print("=" * 60)
-    best_layers = select_best_layers(
-        model, tok, device, answer_ids,
-        data["pairs_irr"], data["pairs_ctrl"],
-        directions, target_layers,
-        args.max_pairs, args.alpha, args.token_set, rng, out)
-    if not args.skip_plots:
-        plot_site_selection(out)
-
-    # === Phase 3: Experiments ===
-    print("\n" + "=" * 60)
-    print("  Phase 3: Running Experiments")
-    print("=" * 60)
-
-    e1 = run_exp1_add_irr(model, tok, device, answer_ids,
-                           data["pairs_irr"], directions, best_layers,
+        e1 = run_exp1_add_irr(model, tok, device, answer_ids,
+                              data["pairs_irr"], directions, best_layers,
+                              args.alpha, args.token_set, args.max_pairs,
+                              rng, out)
+        e2 = run_exp2_abl_irr(model, tok, device, answer_ids,
+                              data["pairs_irr"], directions, best_layers,
+                              args.token_set, args.max_pairs, rng, out)
+        e3 = run_exp3_ctrl(model, tok, device, answer_ids,
+                           data["pairs_ctrl"], data["pairs_irr"],
+                           directions, best_layers,
                            args.alpha, args.token_set, args.max_pairs,
                            rng, out)
-    e2 = run_exp2_abl_irr(model, tok, device, answer_ids,
-                           data["pairs_irr"], directions, best_layers,
-                           args.token_set, args.max_pairs, rng, out)
-    e3 = run_exp3_ctrl(model, tok, device, answer_ids,
-                        data["pairs_ctrl"], data["pairs_irr"],
-                        directions, best_layers,
-                        args.alpha, args.token_set, args.max_pairs,
-                        rng, out)
-    e45 = run_exp45_relevant(model, tok, device, answer_ids,
-                              data["records_rel"], directions,
-                              best_layers, args.alpha, args.token_set,
-                              args.max_pairs, rng, out)
-    e6 = run_exp6_medrel_abl(model, tok, device, answer_ids,
-                              data["pairs_irr"], directions,
-                              best_layers, args.token_set,
-                              args.max_pairs, rng, out)
-    e7 = run_exp7_decomposition(model, tok, device, answer_ids,
+        e45 = run_exp45_relevant(model, tok, device, answer_ids,
+                                 data["records_rel"], directions,
+                                 best_layers, args.alpha, args.token_set,
+                                 args.max_pairs, rng, out)
+        e6 = run_exp6_medrel_abl(model, tok, device, answer_ids,
                                  data["pairs_irr"], directions,
                                  best_layers, args.token_set,
                                  args.max_pairs, rng, out)
+        e7 = run_exp7_decomposition(model, tok, device, answer_ids,
+                                    data["pairs_irr"], directions,
+                                    best_layers, args.token_set,
+                                    args.max_pairs, rng, out)
 
-    # === Phase 4: Predictions & Summary ===
-    print("\n" + "=" * 60)
-    print("  Phase 4: Predictions & Summary")
-    print("=" * 60)
+        # === Phase 4: Predictions & Summary ===
+        print("\n" + "=" * 60)
+        print("  Phase 4: Predictions & Summary")
+        print("=" * 60)
 
-    preds = evaluate_predictions(e1, e2, e3, e45, e6, e7, out)
-    generate_summary(e1, e2, e3, e45, e6, e7, preds, best_layers,
-                     directions, args.token_set, args.alpha, out)
+        preds = evaluate_predictions(e1, e2, e3, e45, e6, e7, out)
+        generate_summary(e1, e2, e3, e45, e6, e7, preds, best_layers,
+                         directions, args.token_set, args.alpha, out)
 
-    # Print prediction digest.
-    print("\n--- Prediction Digest ---")
-    for fam in ALL_FOCAL:
-        if fam not in preds:
-            continue
-        p = preds[fam]
-        parts = [f"  {fam}:"]
-        dm = p.get("P1_mean_delta_M_add")
-        if dm is not None:
-            parts.append(f"P1 ΔM={dm:.4f}")
-        rf = p.get("P2_mean_RF_abl_logit")
-        if rf is not None:
-            parts.append(f"P2 RF={rf:.4f}")
-        sp = p.get("specificity_ratio")
-        if sp is not None:
-            parts.append(f"spec={sp:.3f}")
-        print("  ".join(parts))
+        # Print prediction digest.
+        print("\n--- Prediction Digest ---")
+        for fam in ALL_FOCAL:
+            if fam not in preds:
+                continue
+            p = preds[fam]
+            parts = [f"  {fam}:"]
+            dm = p.get("P1_mean_delta_M_add")
+            if dm is not None:
+                parts.append(f"P1 ΔM={dm:.4f}")
+            rf = p.get("P2_mean_RF_abl_logit")
+            if rf is not None:
+                parts.append(f"P2 RF={rf:.4f}")
+            sp = p.get("specificity_ratio")
+            if sp is not None:
+                parts.append(f"spec={sp:.3f}")
+            print("  ".join(parts))
 
-    print(f"\n{'='*60}")
-    print(f"  Stage 5 complete.  Results: {out}")
-    print(f"{'='*60}\n")
+        print(f"\n{'='*60}")
+        print(f"  Stage 5 complete.  Results: {out}")
+        print(f"{'='*60}\n")
+    except Exception as e:
+        _diag_set("aborted", True)
+        _diag_set("last_error", {"type": type(e).__name__, "message": str(e)[:4000]})
+        raise
+    finally:
+        _diag_flush(out)
 
 
 if __name__ == "__main__":
